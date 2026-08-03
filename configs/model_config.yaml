@@ -1,0 +1,40 @@
+# --- TGNN Encoder ---
+tgnn:
+  backbone: "evolvegcn_o"    # Options: evolvegcn_o | temporal_attention
+  f_node: 6                  # Node input feature dim: [cpu, ram, storage, layer_oh×3]
+  f_edge: 3                  # Edge input feature dim: [bw, latency, active]
+  f_cnf: 5                   # CNF feature dim: [cpu, ram, storage, rate, proc_delay]
+  d_hidden: 128              # Hidden layer dimension
+  d_model: 128               # Output embedding dimension
+  n_spatial_layers: 2        # Number of GCN convolution layers
+  temporal_window: 5         # W — must match env_config.yaml
+  dropout: 0.1
+
+# --- Actor-Critic ---
+actor_critic:
+  d_model: 128               # Must match tgnn.d_model
+  n_attention_heads: 4       # Cross-attention heads (CNF→Node)
+  critic_hidden: [256, 128]  # MLP layers for value network
+
+# --- PPO Hyperparameters ---
+ppo:
+  learning_rate: 3.0e-4
+  n_steps: 512               # Rollout steps before each update
+  n_epochs: 4                # PPO update epochs per rollout
+  batch_size: 64
+  gamma: 0.99                # Discount factor
+  gae_lambda: 0.95           # GAE lambda
+  clip_epsilon: 0.2          # PPO clip ratio
+  value_loss_coef: 0.5
+  entropy_coef: 0.01
+  max_grad_norm: 0.5
+  target_kl: 0.01            # Early stop PPO epoch if KL exceeds this
+
+# --- Training Schedule ---
+training:
+  total_timesteps: 2_000_000
+  log_interval: 1000         # Steps between TensorBoard logs
+  save_interval: 50_000      # Steps between checkpoint saves
+  eval_interval: 25_000      # Steps between mid-training eval runs
+  seed: 42
+  device: "auto"             # auto → cuda if available, else cpu

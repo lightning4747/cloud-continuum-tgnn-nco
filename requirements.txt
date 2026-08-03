@@ -1,0 +1,34 @@
+# --- PyTorch (CPU-only for local dev; Colab uses CUDA auto-detect) ---
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torch-geometric
+
+# --- RL / Environment ---
+gymnasium>=0.29.0
+
+# --- Graph & Math ---
+networkx>=3.0
+numpy>=1.24
+scipy>=1.10
+
+# --- Optimization (MINLP baseline) ---
+gekko
+
+# --- Config & Logging ---
+pyyaml>=6.0
+tensorboard>=2.13
+tqdm
+
+# --- Plotting ---
+matplotlib>=3.7
+seaborn
+
+# --- Dev / Testing ---
+pytest>=7.4
+pytest-cov
+black
+flake8
+pre-commit
+
+# --- Kubernetes dry-run client ---
+kubernetes

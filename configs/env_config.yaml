@@ -1,0 +1,52 @@
+# --- Frozen Phase-1 Dimensional Constants ---
+c_max: 50             # Maximum infrastructure nodes (padded)
+m_max: 150            # Maximum CNF instances (padded)
+h_max: 30             # Maximum SFCs per scheduling interval
+temporal_window: 5    # GRU history window W
+
+# --- Active Scale (sampled uniformly each episode) ---
+c_range: [20, 50]     # Active nodes per episode
+m_range: [40, 150]    # Active CNFs per episode
+h_range: [10, 30]     # Active SFCs per episode
+
+# --- Node Resource Ranges (normalized to [0,1] inside env) ---
+cpu_range: [4, 32]        # cores
+ram_range: [8, 128]       # GB
+storage_range: [50, 1000] # GB
+
+# --- Link Resource Ranges ---
+bw_range: [100, 10000]    # Mbps
+latency_range: [1, 100]   # ms
+
+# --- CNF Demand Ranges ---
+cnf_cpu_range: [0.5, 8]       # cores
+cnf_ram_range: [0.5, 16]      # GB
+cnf_storage_range: [1, 50]    # GB
+cnf_rate_range: [10, 1000]    # Mbps inter-CNF traffic
+cnf_proc_delay_range: [0.1, 5] # ms processing delay
+
+# --- SFC Latency Budget ---
+sfc_delay_budget_range: [20, 200]  # ms end-to-end T_h
+
+# --- Dynamic Noise (Ornstein-Uhlenbeck process) ---
+ou_theta: 0.15        # Mean-reversion speed
+ou_sigma: 0.05        # Volatility
+ou_dt: 1.0            # Time delta per step
+
+# --- Reward Weights ---
+alpha: 1.0            # Latency penalty coefficient
+beta: 10.0            # Infeasibility penalty coefficient
+
+# --- Cost Model (per layer) ---
+cost_per_cpu:
+  edge: 0.05
+  fog: 0.10
+  cloud: 0.20
+
+# --- Layer Assignment ---
+layer_probs: [0.4, 0.3, 0.3]
+
+# --- Topology ---
+waxman_alpha: 0.5     # Waxman graph connection probability parameter
+waxman_beta: 0.5      # Waxman graph distance parameter
+max_episode_steps: 200

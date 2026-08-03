@@ -1,0 +1,35 @@
+# --- Evaluation Protocol ---
+n_test_episodes: 500
+eval_seed: 123
+
+# --- Baselines to run ---
+baselines:
+  - greedy_ffd
+  - greedy_latency_aware
+  - static_gnn
+  - minlp  # Only for small topologies (c_active <= 15, m_active <= 30)
+
+# --- MINLP limits ---
+minlp:
+  max_nodes: 15
+  max_cnfs: 30
+  timeout_seconds: 60
+
+# --- OOD scalability test ---
+ood:
+  c_range: [40, 70]          # Larger than training range
+  m_range: [100, 200]
+  n_episodes: 100
+
+# --- Constraint-tight regime ---
+tight:
+  resource_utilization_factor: 0.95   # Scale demands to 95% of capacity
+  n_episodes: 100
+
+# --- Metrics to compute ---
+metrics:
+  - feasibility_rate
+  - mean_deployment_cost
+  - mean_e2e_latency
+  - optimality_gap          # vs MINLP where available
+  - inference_time_ms
