@@ -4,24 +4,24 @@ tgnn:
   f_node: 6                  # Node input feature dim: [cpu, ram, storage, layer_oh×3]
   f_edge: 3                  # Edge input feature dim: [bw, latency, active]
   f_cnf: 5                   # CNF feature dim: [cpu, ram, storage, rate, proc_delay]
-  d_hidden: 128              # Hidden layer dimension
-  d_model: 128               # Output embedding dimension
+  d_hidden: 256              # Hidden layer dimension (Scaled for GPU VRAM saturation)
+  d_model: 256               # Output embedding dimension
   n_spatial_layers: 2        # Number of GCN convolution layers
   temporal_window: 5         # W — must match env_config.yaml
   dropout: 0.1
 
 # --- Actor-Critic ---
 actor_critic:
-  d_model: 128               # Must match tgnn.d_model
-  n_attention_heads: 4       # Cross-attention heads (CNF→Node)
-  critic_hidden: [256, 128]  # MLP layers for value network
+  d_model: 256               # Must match tgnn.d_model
+  n_attention_heads: 8       # Cross-attention heads (CNF→Node)
+  critic_hidden: [512, 256]  # MLP layers for value network
 
 # --- PPO Hyperparameters ---
 ppo:
   learning_rate: 3.0e-4
-  n_steps: 512               # Rollout steps before each update
+  n_steps: 2048              # Rollout steps per env before update
   n_epochs: 4                # PPO update epochs per rollout
-  batch_size: 64
+  batch_size: 512            # Mini-batch size per GPU step (Scales VRAM to ~12-14 GB)
   gamma: 0.99                # Discount factor
   gae_lambda: 0.95           # GAE lambda
   clip_epsilon: 0.2          # PPO clip ratio

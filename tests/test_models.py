@@ -8,6 +8,7 @@ def test_tgnn_encoder_shapes():
     with open("configs/model_config.yaml", "r") as f:
         cfg = yaml.safe_load(f)
 
+    d_model = cfg["tgnn"]["d_model"]
     encoder = TGNNEncoder(cfg)
     node_features = torch.randn(2, 50, 6)
     edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
@@ -15,8 +16,8 @@ def test_tgnn_encoder_shapes():
     cnf_features = torch.randn(2, 150, 5)
 
     node_emb, cnf_emb = encoder(node_features, edge_index, node_history, cnf_features)
-    assert node_emb.shape == (2, 50, 128)
-    assert cnf_emb.shape == (2, 150, 128)
+    assert node_emb.shape == (2, 50, d_model)
+    assert cnf_emb.shape == (2, 150, d_model)
 
 
 def test_actor_critic_forward_and_sample():

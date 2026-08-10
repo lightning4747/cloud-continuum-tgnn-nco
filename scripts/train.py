@@ -6,47 +6,58 @@ import torch
 import torch.nn.functional as F
 import yaml
 
-from src.env.continuum_env import ContinuumEnv
+from src.env.vector_env import VectorContinuumEnv
 from src.models.actor_critic import ActorCritic
 from src.utils.logger import TrainingLogger
 from src.utils.seed import set_seed
 
 
-def obs_to_tensors(obs: dict, env: ContinuumEnv, device: torch.device):
+def obs_batch_to_tensors(batched_obs: dict, vec_env: VectorContinuumEnv, device: torch.device):
     """
-    Converts observation dict arrays to PyTorch Tensors on target device.
+    Converts batched observation dict arrays from VectorContinuumEnv into PyTorch Tensors on target device.
+    batched_obs['node_features'] shape: (num_envs, C_max, F_node)
     """
-    node_feats = torch.tensor(obs["node_features"], dtype=torch.float32, device=device).unsqueeze(0)
-    edge_idx = torch.tensor(env.current_state.edge_index, dtype=torch.long, device=device)
-    node_hist = torch.tensor(obs["node_history"], dtype=torch.float32, device=device).unsqueeze(0)
-    cnf_feats = torch.tensor(obs["cnf_features"], dtype=torch.float32, device=device).unsqueeze(0)
-    action_mask = torch.tensor(obs["action_mask"], dtype=torch.bool, device=device).unsqueeze(0)
+    node_feats = torch.tensor(batched_obs["node_features"], dtype=torch.float32, device=device)
+    # Share single edge index across parallel envs (same Waxman base connectivity)
+    edge_idx = torch.tensor(vec_env.envs[0].current_state.edge_index, dtype=torch.long, device=device)
+    node_hist = torch.tensor(batched_obs["node_history"], dtype=torch.float32, device=device)
+    cnf_feats = torch.tensor(batched_obs["cnf_features"], dtype=torch.float32, device=device)
+    action_mask = torch.tensor(batched_obs["action_mask"], dtype=torch.bool, device=device)
 
     return node_feats, edge_idx, node_hist, cnf_feats, action_mask
 
 
-def compute_gae(rewards, values, next_value, dones, gamma=0.99, gae_lambda=0.95):
+def compute_gae_vectorized(rewards_matrix, values_matrix, next_values, dones_matrix, gamma=0.99, gae_lambda=0.95):
     """
-    Computes Generalized Advantage Estimation (GAE) and Returns.
+    Computes Generalized Advantage Estimation (GAE) across vectorized env rollouts.
+    rewards_matrix: (N_steps, num_envs)
+    values_matrix: (N_steps, num_envs)
+    next_values: (num_envs,)
     """
-    advantages = []
-    gae = 0.0
-    values_extended = values + [next_value]
+    n_steps, num_envs = rewards_matrix.shape
+    advantages = np.zeros((n_steps, num_envs), dtype=np.float32)
+    gae = np.zeros(num_envs, dtype=np.float32)
 
-    for step in reversed(range(len(rewards))):
-        delta = rewards[step] + gamma * values_extended[step + 1] * (1.0 - float(dones[step])) - values_extended[step]
-        gae = delta + gamma * gae_lambda * (1.0 - float(dones[step])) * gae
-        advantages.insert(0, gae)
+    values_ext = np.vstack([values_matrix, next_values[None, :]])
 
-    returns = [adv + val for adv, val in zip(advantages, values)]
+    for step in reversed(range(n_steps)):
+        delta = rewards_matrix[step] + gamma * values_ext[step + 1] * (1.0 - dones_matrix[step].astype(float)) - values_ext[step]
+        gae = delta + gamma * gae_lambda * (1.0 - dones_matrix[step].astype(float)) * gae
+        advantages[step] = gae
+
+    returns = advantages + values_matrix
     return torch.tensor(advantages, dtype=torch.float32), torch.tensor(returns, dtype=torch.float32)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train TGNN-NCO PPO Placement Policy")
+    parser = argparse.ArgumentParser(description="Train High-Throughput TGNN-NCO PPO Placement Policy")
     parser.add_argument("--config", type=str, default="configs/model_config.yaml", help="Path to model config")
     parser.add_argument("--env-config", type=str, default="configs/env_config.yaml", help="Path to env config")
-    parser.add_argument("--max-steps", type=int, default=2000000, help="Max timesteps")
+    parser.add_argument("--num-envs", type=int, default=16, help="Number of parallel vectorized environments")
+    parser.add_argument("--batch-size", type=int, default=512, help="PPO mini-batch size for GPU optimization")
+    parser.add_argument("--d-model", type=int, default=256, help="Embedding dimension (d_model)")
+    parser.add_argument("--n-steps", type=int, default=2048, help="Rollout steps per environment")
+    parser.add_argument("--max-steps", type=int, default=2000000, help="Max total timesteps")
     parser.add_argument("--device", type=str, default="auto", help="Device (auto, cuda, cuda:0, cpu)")
     parser.add_argument("--dry-run", action="store_true", help="Dry run test mode")
     args = parser.parse_args()
@@ -56,10 +67,16 @@ def main():
     with open(args.env_config, "r") as f:
         env_cfg = yaml.safe_load(f)
 
+    # CLI Overrides
+    if args.d_model:
+        model_cfg["tgnn"]["d_model"] = args.d_model
+        model_cfg["tgnn"]["d_hidden"] = args.d_model
+        model_cfg["actor_critic"]["d_model"] = args.d_model
+
     seed = model_cfg["training"]["seed"]
     set_seed(seed)
 
-    # 1. Device Resolution
+    # Device Resolution
     if args.device == "auto":
         device_str = "cuda" if torch.cuda.is_available() else "cpu"
     else:
@@ -67,33 +84,39 @@ def main():
 
     device = torch.device(device_str)
 
-    print("=" * 60)
-    print(f"  TGNN-NCO PPO Training Engine")
-    print(f"  Target Device : {device_str.upper()}")
-    if device.type == "cuda":
-        print(f"  GPU Name      : {torch.cuda.get_device_name(0)}")
-        print(f"  VRAM Total    : {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-    print("=" * 60)
+    num_envs = 2 if args.dry_run else args.num_envs
+    n_steps = 10 if args.dry_run else args.n_steps
+    batch_size = 4 if args.dry_run else args.batch_size
+    n_epochs = 1 if args.dry_run else model_cfg["ppo"]["n_epochs"]
+    total_timesteps = 20 if args.dry_run else args.max_steps
 
-    # 2. Environment & Model Initialization
-    env = ContinuumEnv(cfg_or_path=env_cfg, seed=seed)
+    print("=" * 70)
+    print(f"  TGNN-NCO High-Throughput PPO Training Engine")
+    print(f"  Target Device     : {device_str.upper()}")
+    print(f"  Parallel Envs     : {num_envs}")
+    print(f"  PPO Mini-Batch    : {batch_size}")
+    print(f"  Embedding d_model : {model_cfg['tgnn']['d_model']}")
+    print(f"  Rollout Steps/Env : {n_steps}")
+    print(f"  Total Rollout/Update: {num_envs * n_steps:,} transitions")
+    if device.type == "cuda":
+        print(f"  GPU Name          : {torch.cuda.get_device_name(0)}")
+        print(f"  VRAM Available    : {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    print("=" * 70)
+
+    # Environment & Model Initialization
+    vec_env = VectorContinuumEnv(num_envs=num_envs, cfg_or_path=env_cfg, seed=seed)
     model = ActorCritic(model_cfg).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=float(model_cfg["ppo"]["learning_rate"]))
     logger = TrainingLogger(log_dir="runs/")
 
-    ppo_cfg = model_cfg["ppo"]
-    n_steps = 10 if args.dry_run else ppo_cfg["n_steps"]
-    batch_size = 2 if args.dry_run else ppo_cfg["batch_size"]
-    n_epochs = 1 if args.dry_run else ppo_cfg["n_epochs"]
-    total_timesteps = 20 if args.dry_run else args.max_steps
-
-    obs, _ = env.reset(seed=seed)
+    batched_obs, _ = vec_env.reset(seed=seed)
     global_step = 0
 
     while global_step < total_timesteps:
-        # Rollout Buffers
+        t_start = time.perf_counter()
+
+        # Rollout Tensors Storage
         obs_node_feats_list = []
-        obs_edge_idx_list = []
         obs_node_hist_list = []
         obs_cnf_feats_list = []
         obs_action_mask_list = []
@@ -105,110 +128,126 @@ def main():
         dones_list = []
         feasibility_list = []
 
-        # 3. Rollout Collection Loop
+        # 1. Parallel Rollout Collection Loop
         for step in range(n_steps):
-            global_step += 1
-            node_f, edge_i, node_h, cnf_f, mask = obs_to_tensors(obs, env, device)
+            global_step += num_envs
+            node_f, edge_i, node_h, cnf_f, mask = obs_batch_to_tensors(batched_obs, vec_env, device)
 
             with torch.no_grad():
-                action, log_prob, entropy, value = model.get_action_and_value(
+                actions, log_prob, entropy, value = model.get_action_and_value(
                     node_f, edge_i, node_h, cnf_f, action_mask=mask
                 )
 
-            action_np = action.squeeze(0).cpu().numpy()
-            next_obs, reward, terminated, truncated, info = env.step(action_np)
-            done = terminated or truncated
+            actions_np = actions.cpu().numpy()  # (num_envs, M_max)
+            next_batched_obs, rewards, terminateds, truncateds, info_list = vec_env.step(actions_np)
+            dones = terminateds | truncateds
 
             obs_node_feats_list.append(node_f)
-            obs_edge_idx_list.append(edge_i)
             obs_node_hist_list.append(node_h)
             obs_cnf_feats_list.append(cnf_f)
             obs_action_mask_list.append(mask)
 
-            actions_list.append(action)
-            log_probs_list.append(log_prob.item())
-            rewards_list.append(reward)
-            values_list.append(value.item())
-            dones_list.append(done)
-            feasibility_list.append(info["feasible"])
+            actions_list.append(actions)
+            log_probs_list.append(log_prob)
+            rewards_list.append(rewards)
+            values_list.append(value.squeeze(-1).cpu().numpy())
+            dones_list.append(dones)
 
-            obs = next_obs
-            if done:
-                obs, _ = env.reset()
+            for info in info_list:
+                feasibility_list.append(info["feasible"])
 
-        # 4. GAE Advantage Calculation
+            batched_obs = next_batched_obs
+
+        # 2. Vectorized GAE Advantage Computation
         with torch.no_grad():
-            node_f_next, edge_i_next, node_h_next, cnf_f_next, _ = obs_to_tensors(obs, env, device)
-            next_val = model.get_value(node_f_next, edge_i_next, node_h_next, cnf_f_next).item()
+            node_f_next, edge_i_next, node_h_next, cnf_f_next, _ = obs_batch_to_tensors(batched_obs, vec_env, device)
+            next_vals = model.get_value(node_f_next, edge_i_next, node_h_next, cnf_f_next).squeeze(-1).cpu().numpy()
 
-        advantages, returns = compute_gae(
-            rewards_list, values_list, next_val, dones_list,
-            gamma=ppo_cfg["gamma"], gae_lambda=ppo_cfg["gae_lambda"]
+        rewards_mat = np.array(rewards_list, dtype=np.float32)  # (N_steps, num_envs)
+        values_mat = np.array(values_list, dtype=np.float32)    # (N_steps, num_envs)
+        dones_mat = np.array(dones_list, dtype=bool)            # (N_steps, num_envs)
+
+        advantages_tensor, returns_tensor = compute_gae_vectorized(
+            rewards_mat, values_mat, next_vals, dones_mat,
+            gamma=float(model_cfg["ppo"]["gamma"]), gae_lambda=float(model_cfg["ppo"]["gae_lambda"])
         )
 
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        advantages = advantages.to(device)
-        returns = returns.to(device)
+        # Flatten rollout dimensions (N_steps * num_envs, ...)
+        total_samples = n_steps * num_envs
+        flat_node_feats = torch.cat(obs_node_feats_list, dim=0)    # (total_samples, C_max, F_node)
+        flat_node_hist = torch.cat(obs_node_hist_list, dim=0)      # (total_samples, W, C_max, F_node)
+        flat_cnf_feats = torch.cat(obs_cnf_feats_list, dim=0)      # (total_samples, M_max, F_cnf)
+        flat_action_masks = torch.cat(obs_action_mask_list, dim=0)  # (total_samples, M_max, C_max)
+        flat_actions = torch.cat(actions_list, dim=0)              # (total_samples, M_max)
+        flat_old_log_probs = torch.cat(log_probs_list, dim=0)      # (total_samples,)
 
-        # Batched Tensor Stack
-        b_node_feats = torch.cat(obs_node_feats_list, dim=0)    # (N_steps, C_max, F_node)
-        b_node_hist = torch.cat(obs_node_hist_list, dim=0)      # (N_steps, W, C_max, F_node)
-        b_cnf_feats = torch.cat(obs_cnf_feats_list, dim=0)      # (N_steps, M_max, F_cnf)
-        b_action_masks = torch.cat(obs_action_mask_list, dim=0)  # (N_steps, M_max, C_max)
-        b_actions = torch.cat(actions_list, dim=0)              # (N_steps, M_max)
-        b_old_log_probs = torch.tensor(log_probs_list, dtype=torch.float32, device=device)
+        flat_advantages = advantages_tensor.reshape(-1)
+        flat_returns = returns_tensor.reshape(-1)
 
-        # 5. PPO Batched Mini-Batch Optimization
-        dataset_size = len(rewards_list)
+        # Advantage Normalization
+        flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-8)
+        flat_advantages = flat_advantages.to(device)
+        flat_returns = flat_returns.to(device)
+
+        # Shared Edge Index
+        edge_i_shared = torch.tensor(vec_env.envs[0].current_state.edge_index, dtype=torch.long, device=device)
+
+        # 3. PPO GPU Batched Mini-Batch Optimization
         for epoch in range(n_epochs):
-            indices = np.arange(dataset_size)
+            indices = np.arange(total_samples)
             np.random.shuffle(indices)
 
-            for start in range(0, dataset_size, batch_size):
+            for start in range(0, total_samples, batch_size):
                 end = start + batch_size
                 mb_idx = indices[start:end]
 
-                mb_node_f = b_node_feats[mb_idx]
-                mb_node_h = b_node_hist[mb_idx]
-                mb_cnf_f = b_cnf_feats[mb_idx]
-                mb_mask = b_action_masks[mb_idx]
-                mb_act = b_actions[mb_idx]
-                mb_old_lp = b_old_log_probs[mb_idx]
-                mb_adv = advantages[mb_idx]
-                mb_ret = returns[mb_idx]
-
-                # Edge index shared for same graph structure
-                mb_edge_i = obs_edge_idx_list[mb_idx[0]]
+                mb_node_f = flat_node_feats[mb_idx]
+                mb_node_h = flat_node_hist[mb_idx]
+                mb_cnf_f = flat_cnf_feats[mb_idx]
+                mb_mask = flat_action_masks[mb_idx]
+                mb_act = flat_actions[mb_idx]
+                mb_old_lp = flat_old_log_probs[mb_idx]
+                mb_adv = flat_advantages[mb_idx]
+                mb_ret = flat_returns[mb_idx]
 
                 _, new_log_prob, new_entropy, new_value = model.get_action_and_value(
-                    mb_node_f, mb_edge_i, mb_node_h, mb_cnf_f, action_mask=mb_mask, action=mb_act
+                    mb_node_f, edge_i_shared, mb_node_h, mb_cnf_f, action_mask=mb_mask, action=mb_act
                 )
 
                 ratio = torch.exp(new_log_prob - mb_old_lp)
                 surr1 = ratio * mb_adv
-                surr2 = torch.clamp(ratio, 1.0 - ppo_cfg["clip_epsilon"], 1.0 + ppo_cfg["clip_epsilon"]) * mb_adv
+                surr2 = torch.clamp(ratio, 1.0 - float(model_cfg["ppo"]["clip_epsilon"]), 1.0 + float(model_cfg["ppo"]["clip_epsilon"])) * mb_adv
 
                 policy_loss = -torch.min(surr1, surr2).mean()
                 value_loss = F.mse_loss(new_value.squeeze(-1), mb_ret)
                 entropy_loss = -new_entropy.mean()
 
                 loss = (policy_loss
-                        + float(ppo_cfg["value_loss_coef"]) * value_loss
-                        + float(ppo_cfg["entropy_coef"]) * entropy_loss)
+                        + float(model_cfg["ppo"]["value_loss_coef"]) * value_loss
+                        + float(model_cfg["ppo"]["entropy_coef"]) * entropy_loss)
 
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), float(ppo_cfg["max_grad_norm"]))
+                torch.nn.utils.clip_grad_norm_(model.parameters(), float(model_cfg["ppo"]["max_grad_norm"]))
                 optimizer.step()
 
-        # 6. Metrics & Progress Logging
-        mean_reward = float(np.mean(rewards_list))
+        # 4. Metrics & Performance Reporting
+        t_elapsed = time.perf_counter() - t_start
+        fps = total_samples / t_elapsed
+        mean_reward = float(np.mean(rewards_mat))
         feas_rate = float(np.mean(feasibility_list)) * 100.0
+
+        vram_allocated_gb = 0.0
+        if device.type == "cuda":
+            vram_allocated_gb = torch.cuda.max_memory_allocated(0) / 1e9
+
         logger.log_console(global_step, {
             "reward": mean_reward,
             "feas_rate": f"{feas_rate:.1f}%",
             "p_loss": policy_loss.item(),
             "v_loss": value_loss.item(),
+            "fps": f"{fps:.1f}",
+            "vram_gb": f"{vram_allocated_gb:.2f}GB" if device.type == "cuda" else "N/A",
         })
 
         if global_step % model_cfg["training"]["save_interval"] == 0:
