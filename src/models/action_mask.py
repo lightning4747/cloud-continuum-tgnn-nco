@@ -3,12 +3,14 @@ import torch
 
 def apply_action_mask(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """
-    Sets logits of invalid placement actions to -1e9.
+    Sets logits of invalid placement actions to a large negative scalar.
+    Supports FP16 (Half precision) without overflow.
     logits: (B, M_max, C_max) or (M_max, C_max)
     mask: (B, M_max, C_max) or (M_max, C_max) bool/binary
     """
     mask_bool = mask.bool()
-    masked_logits = logits.masked_fill(~mask_bool, -1e9)
+    fill_value = -1e4 if logits.dtype == torch.float16 else -1e9
+    masked_logits = logits.masked_fill(~mask_bool, fill_value)
     return masked_logits
 
 
