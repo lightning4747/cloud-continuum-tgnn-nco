@@ -1,68 +1,29 @@
-import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from src.env.continuum_env import ContinuumEnv
 
 
-def _worker_loop(remote, parent_remote, cfg_or_path, seed):
-    parent_remote.close()
-    env = ContinuumEnv(cfg_or_path=cfg_or_path, seed=seed)
-    try:
-        while True:
-            cmd, data = remote.recv()
-            if cmd == "step":
-                action = data
-                obs, reward, terminated, truncated, info = env.step(action)
-                if terminated or truncated:
-                    obs, _ = env.reset()
-                remote.send((obs, reward, terminated, truncated, info))
-            elif cmd == "reset":
-                obs, info = env.reset(seed=data)
-                remote.send((obs, info))
-            elif cmd == "close":
-                remote.close()
-                break
-            else:
-                raise NotImplementedError(f"Unknown worker command: {cmd}")
-    except Exception as e:
-        remote.send(e)
-
-
 class ParallelVectorContinuumEnv:
     """
-    Multiprocess parallel vectorized environment wrapper.
-    Executes environment steps concurrently across dedicated CPU worker processes.
+    Lightweight parallel vectorized environment wrapper using ThreadPoolExecutor.
+    Executes environment steps concurrently within a single process without RAM process duplication.
     """
 
     def __init__(self, num_envs: int = 16, cfg_or_path: dict | str = "configs/env_config.yaml", seed: int = 42):
         self.num_envs = num_envs
-        self.closed = False
-        ctx = mp.get_context("spawn")
+        self.envs = [ContinuumEnv(cfg_or_path=cfg_or_path, seed=seed + i) for i in range(num_envs)]
+        self.executor = ThreadPoolExecutor(max_workers=num_envs)
 
-        self.remotes, self.work_remotes = zip(*[ctx.Pipe() for _ in range(num_envs)])
-        self.ps = []
-
-        for i, (work_remote, remote) in enumerate(zip(self.work_remotes, self.remotes)):
-            p = ctx.Process(
-                target=_worker_loop,
-                args=(work_remote, remote, cfg_or_path, seed + i),
-                daemon=True,
-            )
-            p.start()
-            self.ps.append(p)
-            work_remote.close()
-
-        # Query single env sample properties
-        sample_env = ContinuumEnv(cfg_or_path=cfg_or_path, seed=seed)
-        self.c_max = sample_env.c_max
-        self.m_max = sample_env.m_max
-        self.w = sample_env.w
-        self.sample_obs, _ = sample_env.reset(seed=seed)
+        self.c_max = self.envs[0].c_max
+        self.m_max = self.envs[0].m_max
+        self.w = self.envs[0].w
 
     def reset(self, seed: int = 42) -> tuple[dict, list[dict]]:
-        for i, remote in enumerate(self.remotes):
-            remote.send(("reset", seed + i))
+        def _reset_env(args):
+            i, env = args
+            return env.reset(seed=seed + i)
 
-        results = [remote.recv() for remote in self.remotes]
+        results = list(self.executor.map(_reset_env, enumerate(self.envs)))
         obs_list, info_list = zip(*results)
 
         batched_obs = self._stack_obs(obs_list)
@@ -72,10 +33,14 @@ class ParallelVectorContinuumEnv:
         """
         actions: (num_envs, M_max) numpy array
         """
-        for i, remote in enumerate(self.remotes):
-            remote.send(("step", actions[i]))
+        def _step_env(args):
+            i, env = args
+            obs, reward, terminated, truncated, info = env.step(actions[i])
+            if terminated or truncated:
+                obs, _ = env.reset()
+            return obs, reward, terminated, truncated, info
 
-        results = [remote.recv() for remote in self.remotes]
+        results = list(self.executor.map(_step_env, enumerate(self.envs)))
         obs_list, rewards, terminateds, truncateds, info_list = zip(*results)
 
         batched_obs = self._stack_obs(obs_list)
@@ -94,10 +59,4 @@ class ParallelVectorContinuumEnv:
         return batched_obs
 
     def close(self):
-        if self.closed:
-            return
-        for remote in self.remotes:
-            remote.send(("close", None))
-        for p in self.ps:
-            p.join()
-        self.closed = True
+        self.executor.shutdown(wait=True)
