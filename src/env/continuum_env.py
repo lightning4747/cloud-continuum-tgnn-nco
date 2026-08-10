@@ -2,6 +2,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import networkx as nx
 import numpy as np
+from scipy.sparse.csgraph import floyd_warshall
 import yaml
 
 from src.env.generator import NetworkState, SFCBatch, TopologyGenerator
@@ -11,6 +12,7 @@ from src.env.state_buffer import TemporalStateBuffer
 class ContinuumEnv(gym.Env):
     """
     Gymnasium-compliant environment for dynamic CNF placement on the Cloud-Continuum.
+    Optimized with precomputed Floyd-Warshall routing matrices for fast environment steps.
     """
 
     metadata = {"render_modes": []}
@@ -48,12 +50,35 @@ class ContinuumEnv(gym.Env):
         self.current_state: NetworkState = None
         self.current_sfcs: SFCBatch = None
         self.current_step = 0
+        self._dist_matrix = None
+        self._pred_matrix = None
+
+    def _update_shortest_paths(self):
+        """
+        Precomputes all-pairs shortest path distance and predecessor matrices using Floyd-Warshall.
+        Executed once per topology state update for fast O(1) routing lookups.
+        """
+        n_act = self.current_state.n_active_nodes
+        adj = np.full((n_act, n_act), np.inf, dtype=np.float64)
+        np.fill_diagonal(adj, 0.0)
+
+        for u in range(n_act):
+            for v in range(u + 1, n_act):
+                if self.current_state.edge_active[u, v]:
+                    lat = self.current_state.edge_latency[u, v]
+                    adj[u, v] = lat
+                    adj[v, u] = lat
+
+        dist, pred = floyd_warshall(adj, return_predecessors=True)
+        self._dist_matrix = dist
+        self._pred_matrix = pred
 
     def reset(self, seed: int | None = None, options: dict | None = None) -> tuple[dict, dict]:
         super().reset(seed=seed)
         self.current_step = 0
         self.current_state, self.current_sfcs = self.generator.reset(seed=seed)
         self.state_buffer.reset(self.current_state)
+        self._update_shortest_paths()
 
         obs = self._build_obs()
         info = {
@@ -80,6 +105,7 @@ class ContinuumEnv(gym.Env):
         # Advance environment state
         self.current_state, self.current_sfcs = self.generator.step(self.current_state, self.current_sfcs)
         self.state_buffer.push(self.current_state)
+        self._update_shortest_paths()
 
         obs = self._build_obs()
         truncated = self.current_step >= self.max_steps
@@ -128,6 +154,8 @@ class ContinuumEnv(gym.Env):
                     and self.current_state.node_storage[i] >= cnf_s
                 ):
                     mask[m, i] = 1
+            if mask[m].sum() == 0:
+                mask[m, 0] = 1  # Fallback to avoid all-zero mask
         return mask
 
     def _check_capacity_constraints(self, placement: np.ndarray) -> tuple[bool, dict]:
@@ -149,20 +177,8 @@ class ContinuumEnv(gym.Env):
 
     def _check_bw_constraints(self, placement: np.ndarray) -> tuple[bool, dict]:
         link_flow = np.zeros((self.c_max, self.c_max), dtype=np.float32)
-
-        # Build NetworkX graph for routing
-        n_act = self.current_state.n_active_nodes
-        g = nx.Graph()
-        for i in range(n_act):
-            g.add_node(i)
-
-        for u in range(n_act):
-            for v in range(u + 1, n_act):
-                if self.current_state.edge_active[u, v]:
-                    g.add_edge(u, v, weight=self.current_state.edge_latency[u, v])
-
-        # Track flows for consecutive CNF pairs in same SFC
         active_sfcs = np.where(self.current_sfcs.sfc_active)[0]
+
         for sid in active_sfcs:
             cnf_indices = np.where((self.current_sfcs.sfc_id == sid) & self.current_sfcs.cnf_active)[0]
             if len(cnf_indices) < 2:
@@ -177,13 +193,26 @@ class ContinuumEnv(gym.Env):
                 rate = self.current_sfcs.cnf_rate[u_cnf]
 
                 if node_u != node_v:
-                    try:
-                        path = nx.shortest_path(g, source=node_u, target=node_v, weight="weight")
-                        for p in range(len(path) - 1):
-                            link_flow[path[p], path[p + 1]] += rate
-                            link_flow[path[p + 1], path[p]] += rate
-                    except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    if (
+                        node_u >= self._dist_matrix.shape[0]
+                        or node_v >= self._dist_matrix.shape[0]
+                        or np.isinf(self._dist_matrix[node_u, node_v])
+                    ):
                         return False, {"bw_violations": 1, "no_path": True}
+
+                    # Reconstruct path using predecessor matrix
+                    curr = node_v
+                    path = [curr]
+                    while curr != node_u:
+                        curr = self._pred_matrix[node_u, curr]
+                        if curr == -9999 or curr < 0:  # Invalid predecessor
+                            return False, {"bw_violations": 1, "no_path": True}
+                        path.append(curr)
+                    path.reverse()
+
+                    for p in range(len(path) - 1):
+                        link_flow[path[p], path[p + 1]] += rate
+                        link_flow[path[p + 1], path[p]] += rate
 
         bw_ok = np.all(link_flow <= self.current_state.edge_bw + 1e-5)
         return bool(bw_ok), {"bw_violations": int(np.sum(link_flow > self.current_state.edge_bw + 1e-5))}
@@ -193,25 +222,14 @@ class ContinuumEnv(gym.Env):
         node_costs = np.array([cost_map[int(self.current_state.node_layer[i])] for i in range(self.c_max)], dtype=np.float32)
 
         cnf_cpus = self.current_sfcs.cnf_cpu * self.current_sfcs.cnf_active
-        # Total cost = sum(placement * cnf_cpu * node_cost)
         total_cost = float(np.sum(placement * cnf_cpus[:, None] * node_costs[None, :]))
         return total_cost
 
     def _compute_latency_penalty(self, placement: np.ndarray) -> tuple[float, dict[int, float]]:
         latencies = {}
         penalty = 0.0
-
-        n_act = self.current_state.n_active_nodes
-        g = nx.Graph()
-        for i in range(n_act):
-            g.add_node(i)
-
-        for u in range(n_act):
-            for v in range(u + 1, n_act):
-                if self.current_state.edge_active[u, v]:
-                    g.add_edge(u, v, weight=self.current_state.edge_latency[u, v])
-
         active_sfcs = np.where(self.current_sfcs.sfc_active)[0]
+
         for sid in active_sfcs:
             cnf_indices = np.where((self.current_sfcs.sfc_id == sid) & self.current_sfcs.cnf_active)[0]
             if len(cnf_indices) == 0:
@@ -227,11 +245,14 @@ class ContinuumEnv(gym.Env):
                 node_v = int(np.argmax(placement[v_cnf]))
 
                 if node_u != node_v:
-                    try:
-                        path_len = nx.shortest_path_length(g, source=node_u, target=node_v, weight="weight")
-                        trans_delay += float(path_len)
-                    except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    if (
+                        node_u >= self._dist_matrix.shape[0]
+                        or node_v >= self._dist_matrix.shape[0]
+                        or np.isinf(self._dist_matrix[node_u, node_v])
+                    ):
                         trans_delay += 500.0  # Path failure penalty
+                    else:
+                        trans_delay += float(self._dist_matrix[node_u, node_v])
 
             total_delay = proc_delay + trans_delay
             latencies[int(sid)] = total_delay
@@ -249,7 +270,6 @@ class ContinuumEnv(gym.Env):
         return r
 
     def _build_obs(self) -> dict:
-        # Edge attr flattened matrix
         edge_attr_mat = np.zeros((self.c_max * self.c_max, 3), dtype=np.float32)
         if len(self.current_state.edge_attr) > 0:
             src = self.current_state.edge_index[0]

@@ -65,12 +65,11 @@ def main():
     parser = argparse.ArgumentParser(description="Train High-Throughput TGNN-NCO PPO Placement Policy")
     parser.add_argument("--config", type=str, default="configs/model_config.yaml", help="Path to model config")
     parser.add_argument("--env-config", type=str, default="configs/env_config.yaml", help="Path to env config")
-    parser.add_argument("--num-envs", type=int, default=16, help="Number of parallel vectorized environments")
-    parser.add_argument("--batch-size", type=int, default=512, help="PPO mini-batch size for GPU optimization")
+    parser.add_argument("--num-envs", type=int, default=32, help="Number of parallel vectorized environments")
+    parser.add_argument("--batch-size", type=int, default=1024, help="PPO mini-batch size for GPU optimization")
     parser.add_argument("--d-model", type=int, default=256, help="Embedding dimension (d_model)")
-    parser.add_argument("--n-steps", type=int, default=2048, help="Rollout steps per environment")
+    parser.add_argument("--n-steps", type=int, default=128, help="Rollout steps per environment")
     parser.add_argument("--max-steps", type=int, default=2000000, help="Max total timesteps")
-    parser.add_argument("--log-interval", type=int, default=2048, help="Timesteps interval between progress metric logs")
     parser.add_argument("--device", type=str, default="auto", help="Device (auto, cuda, cuda:0, cpu)")
     parser.add_argument("--use-amp", action="store_true", default=True, help="Use Automatic Mixed Precision (AMP)")
     parser.add_argument("--no-parallel", action="store_true", help="Disable multiprocess env vectorization")
@@ -106,7 +105,6 @@ def main():
     batch_size = 4 if args.dry_run else args.batch_size
     n_epochs = 1 if args.dry_run else model_cfg["ppo"]["n_epochs"]
     total_timesteps = 20 if args.dry_run else args.max_steps
-    log_interval = args.log_interval
 
     print("=" * 80, flush=True)
     print(f"  TGNN-NCO High-Throughput PPO Training Engine", flush=True)
@@ -123,23 +121,26 @@ def main():
     print("=" * 80, flush=True)
 
     # Environment Initialization
+    print("[1/3] Initializing Vectorized Environments...", flush=True)
     if args.no_parallel or args.dry_run:
         vec_env = VectorContinuumEnv(num_envs=num_envs, cfg_or_path=env_cfg, seed=seed)
     else:
         vec_env = ParallelVectorContinuumEnv(num_envs=num_envs, cfg_or_path=env_cfg, seed=seed)
 
+    print("[2/3] Resetting Vectorized Environments...", flush=True)
     batched_obs, _ = vec_env.reset(seed=seed)
     if hasattr(vec_env, "envs"):
         edge_index_np = vec_env.envs[0].current_state.edge_index
     else:
         edge_index_np = np.array([[0, 1], [1, 0]], dtype=np.int64)
 
+    print("[3/3] Initializing TGNN Policy Network...", flush=True)
     model = ActorCritic(model_cfg).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=float(model_cfg["ppo"]["learning_rate"]))
     logger = TrainingLogger(log_dir="runs/")
 
     global_step = 0
-    last_logged_step = 0
+    print(">>> Starting Training Loop...", flush=True)
 
     try:
         while global_step < total_timesteps:
@@ -265,7 +266,7 @@ def main():
                     scaler.step(optimizer)
                     scaler.update()
 
-            # 4. Progress Metrics Printing after every log_interval steps (or every update)
+            # 4. Progress Metrics Printing after every update iteration
             t_elapsed = time.perf_counter() - t_start
             fps = total_samples / t_elapsed
             mean_reward = float(np.mean(rewards_mat))
@@ -275,26 +276,24 @@ def main():
             if device.type == "cuda":
                 vram_allocated_gb = torch.cuda.max_memory_allocated(0) / 1e9
 
-            if global_step - last_logged_step >= log_interval or global_step >= total_timesteps or args.dry_run:
-                last_logged_step = global_step
-                progress_pct = (global_step / total_timesteps) * 100.0
-                vram_str = f" | VRAM: {vram_allocated_gb:5.2f}GB" if device.type == "cuda" else ""
-                print(
-                    f"Step {global_step:8d}/{total_timesteps} ({progress_pct:5.1f}%) | "
-                    f"Reward: {mean_reward:10.2f} | "
-                    f"FeasRate: {feas_rate:5.1f}% | "
-                    f"PLoss: {policy_loss.item():7.4f} | "
-                    f"VLoss: {value_loss.item():10.2f} | "
-                    f"Entropy: {entropy_loss.item():6.3f} | "
-                    f"FPS: {fps:6.1f}" + vram_str,
-                    flush=True,
-                )
+            progress_pct = (global_step / total_timesteps) * 100.0
+            vram_str = f" | VRAM: {vram_allocated_gb:5.2f}GB" if device.type == "cuda" else ""
+            print(
+                f"Step {global_step:8d}/{total_timesteps} ({progress_pct:5.1f}%) | "
+                f"Reward: {mean_reward:10.2f} | "
+                f"FeasRate: {feas_rate:5.1f}% | "
+                f"PLoss: {policy_loss.item():7.4f} | "
+                f"VLoss: {value_loss.item():10.2f} | "
+                f"Entropy: {entropy_loss.item():6.3f} | "
+                f"FPS: {fps:6.1f}" + vram_str,
+                flush=True,
+            )
 
-                logger.log_scalar("train/reward", mean_reward, global_step)
-                logger.log_scalar("train/feasibility_rate", feas_rate, global_step)
-                logger.log_scalar("train/policy_loss", policy_loss.item(), global_step)
-                logger.log_scalar("train/value_loss", value_loss.item(), global_step)
-                logger.log_scalar("train/fps", fps, global_step)
+            logger.log_scalar("train/reward", mean_reward, global_step)
+            logger.log_scalar("train/feasibility_rate", feas_rate, global_step)
+            logger.log_scalar("train/policy_loss", policy_loss.item(), global_step)
+            logger.log_scalar("train/value_loss", value_loss.item(), global_step)
+            logger.log_scalar("train/fps", fps, global_step)
 
             if global_step % model_cfg["training"]["save_interval"] == 0:
                 os.makedirs("checkpoints", exist_ok=True)
