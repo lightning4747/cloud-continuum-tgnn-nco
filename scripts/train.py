@@ -66,7 +66,7 @@ def main():
     parser.add_argument("--config", type=str, default="configs/model_config.yaml", help="Path to model config")
     parser.add_argument("--env-config", type=str, default="configs/env_config.yaml", help="Path to env config")
     parser.add_argument("--num-envs", type=int, default=32, help="Number of parallel vectorized environments")
-    parser.add_argument("--batch-size", type=int, default=1024, help="PPO mini-batch size for GPU optimization")
+    parser.add_argument("--batch-size", type=int, default=512, help="PPO mini-batch size for GPU optimization")
     parser.add_argument("--d-model", type=int, default=256, help="Embedding dimension (d_model)")
     parser.add_argument("--n-steps", type=int, default=128, help="Rollout steps per environment")
     parser.add_argument("--max-steps", type=int, default=2000000, help="Max total timesteps")
