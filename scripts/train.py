@@ -103,19 +103,19 @@ def main():
     total_timesteps = 20 if args.dry_run else args.max_steps
     log_interval = args.log_interval
 
-    print("=" * 80)
-    print(f"  TGNN-NCO High-Throughput PPO Training Engine")
-    print(f"  Target Device       : {device_str.upper()}")
-    print(f"  Automatic Precision : {'AMP FP16' if use_amp else 'FP32'}")
-    print(f"  Parallel Multiprocess: {'Disabled' if args.no_parallel or args.dry_run else f'Enabled ({num_envs} CPU workers)'}")
-    print(f"  PPO Mini-Batch      : {batch_size}")
-    print(f"  Embedding d_model   : {model_cfg['tgnn']['d_model']}")
-    print(f"  Rollout Steps/Env   : {n_steps}")
-    print(f"  Total Rollout/Update: {num_envs * n_steps:,} transitions")
+    print("=" * 80, flush=True)
+    print(f"  TGNN-NCO High-Throughput PPO Training Engine", flush=True)
+    print(f"  Target Device       : {device_str.upper()}", flush=True)
+    print(f"  Automatic Precision : {'AMP FP16' if use_amp else 'FP32'}", flush=True)
+    print(f"  Parallel Vector Envs: {'Disabled' if args.no_parallel or args.dry_run else f'Enabled ({num_envs} envs)'}", flush=True)
+    print(f"  PPO Mini-Batch      : {batch_size}", flush=True)
+    print(f"  Embedding d_model   : {model_cfg['tgnn']['d_model']}", flush=True)
+    print(f"  Rollout Steps/Env   : {n_steps}", flush=True)
+    print(f"  Total Rollout/Update: {num_envs * n_steps:,} transitions", flush=True)
     if device.type == "cuda":
-        print(f"  GPU Name            : {torch.cuda.get_device_name(0)}")
-        print(f"  VRAM Available      : {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-    print("=" * 80)
+        print(f"  GPU Name            : {torch.cuda.get_device_name(0)}", flush=True)
+        print(f"  VRAM Available      : {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB", flush=True)
+    print("=" * 80, flush=True)
 
     # Environment Initialization
     if args.no_parallel or args.dry_run:
@@ -281,7 +281,8 @@ def main():
                     f"PLoss: {policy_loss.item():7.4f} | "
                     f"VLoss: {value_loss.item():10.2f} | "
                     f"Entropy: {entropy_loss.item():6.3f} | "
-                    f"FPS: {fps:6.1f}" + vram_str
+                    f"FPS: {fps:6.1f}" + vram_str,
+                    flush=True,
                 )
 
                 logger.log_scalar("train/reward", mean_reward, global_step)
@@ -294,14 +295,14 @@ def main():
                 os.makedirs("checkpoints", exist_ok=True)
                 ckpt_path = f"checkpoints/tgnn_ppo_step_{global_step}.pt"
                 torch.save({"model_state": model.state_dict(), "step": global_step}, ckpt_path)
-                print(f"--> Checkpoint saved to {ckpt_path}")
+                print(f"--> Checkpoint saved to {ckpt_path}", flush=True)
 
     finally:
         if hasattr(vec_env, "close"):
             vec_env.close()
 
     logger.close()
-    print("Training finished successfully!")
+    print("Training finished successfully!", flush=True)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import os
 import numpy as np
 from src.env.continuum_env import ContinuumEnv
 
@@ -12,7 +13,11 @@ class ParallelVectorContinuumEnv:
     def __init__(self, num_envs: int = 16, cfg_or_path: dict | str = "configs/env_config.yaml", seed: int = 42):
         self.num_envs = num_envs
         self.envs = [ContinuumEnv(cfg_or_path=cfg_or_path, seed=seed + i) for i in range(num_envs)]
-        self.executor = ThreadPoolExecutor(max_workers=num_envs)
+
+        # Cap max thread workers to 2x physical CPU core count to avoid Python GIL lock thrashing
+        cpu_count = os.cpu_count() or 4
+        max_workers = min(num_envs, cpu_count * 2)
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
 
         self.c_max = self.envs[0].c_max
         self.m_max = self.envs[0].m_max
