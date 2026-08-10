@@ -1,10 +1,15 @@
 import argparse
 import os
+import sys
+from pathlib import Path
 import time
 import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
+
+# Ensure project root is in sys.path for absolute imports on Colab/remote executions
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.env.parallel_vector_env import ParallelVectorContinuumEnv
 from src.env.vector_env import VectorContinuumEnv

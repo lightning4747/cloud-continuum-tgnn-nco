@@ -1,7 +1,12 @@
 import argparse
 import os
+import sys
+from pathlib import Path
 import numpy as np
 import yaml
+
+# Ensure project root is in sys.path for absolute imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.baselines.greedy import GreedyFFD, GreedyLatencyAware
 from src.env.continuum_env import ContinuumEnv
