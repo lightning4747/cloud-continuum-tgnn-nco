@@ -65,6 +65,7 @@ def main():
     parser.add_argument("--d-model", type=int, default=256, help="Embedding dimension (d_model)")
     parser.add_argument("--n-steps", type=int, default=2048, help="Rollout steps per environment")
     parser.add_argument("--max-steps", type=int, default=2000000, help="Max total timesteps")
+    parser.add_argument("--log-interval", type=int, default=2048, help="Timesteps interval between progress metric logs")
     parser.add_argument("--device", type=str, default="auto", help="Device (auto, cuda, cuda:0, cpu)")
     parser.add_argument("--use-amp", action="store_true", default=True, help="Use Automatic Mixed Precision (AMP)")
     parser.add_argument("--no-parallel", action="store_true", help="Disable multiprocess env vectorization")
@@ -100,8 +101,9 @@ def main():
     batch_size = 4 if args.dry_run else args.batch_size
     n_epochs = 1 if args.dry_run else model_cfg["ppo"]["n_epochs"]
     total_timesteps = 20 if args.dry_run else args.max_steps
+    log_interval = args.log_interval
 
-    print("=" * 70)
+    print("=" * 80)
     print(f"  TGNN-NCO High-Throughput PPO Training Engine")
     print(f"  Target Device       : {device_str.upper()}")
     print(f"  Automatic Precision : {'AMP FP16' if use_amp else 'FP32'}")
@@ -113,7 +115,7 @@ def main():
     if device.type == "cuda":
         print(f"  GPU Name            : {torch.cuda.get_device_name(0)}")
         print(f"  VRAM Available      : {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-    print("=" * 70)
+    print("=" * 80)
 
     # Environment Initialization
     if args.no_parallel or args.dry_run:
@@ -125,7 +127,6 @@ def main():
     if hasattr(vec_env, "envs"):
         edge_index_np = vec_env.envs[0].current_state.edge_index
     else:
-        # Padded edge index for active nodes
         edge_index_np = np.array([[0, 1], [1, 0]], dtype=np.int64)
 
     model = ActorCritic(model_cfg).to(device)
@@ -133,6 +134,7 @@ def main():
     logger = TrainingLogger(log_dir="runs/")
 
     global_step = 0
+    last_logged_step = 0
 
     try:
         while global_step < total_timesteps:
@@ -258,7 +260,7 @@ def main():
                     scaler.step(optimizer)
                     scaler.update()
 
-            # 4. Metrics & Performance Reporting
+            # 4. Progress Metrics Printing after every log_interval steps (or every update)
             t_elapsed = time.perf_counter() - t_start
             fps = total_samples / t_elapsed
             mean_reward = float(np.mean(rewards_mat))
@@ -268,20 +270,31 @@ def main():
             if device.type == "cuda":
                 vram_allocated_gb = torch.cuda.max_memory_allocated(0) / 1e9
 
-            logger.log_console(global_step, {
-                "reward": mean_reward,
-                "feas_rate": f"{feas_rate:.1f}%",
-                "p_loss": policy_loss.item(),
-                "v_loss": value_loss.item(),
-                "fps": f"{fps:.1f}",
-                "vram_gb": f"{vram_allocated_gb:.2f}GB" if device.type == "cuda" else "N/A",
-            })
+            if global_step - last_logged_step >= log_interval or global_step >= total_timesteps or args.dry_run:
+                last_logged_step = global_step
+                progress_pct = (global_step / total_timesteps) * 100.0
+                vram_str = f" | VRAM: {vram_allocated_gb:5.2f}GB" if device.type == "cuda" else ""
+                print(
+                    f"Step {global_step:8d}/{total_timesteps} ({progress_pct:5.1f}%) | "
+                    f"Reward: {mean_reward:10.2f} | "
+                    f"FeasRate: {feas_rate:5.1f}% | "
+                    f"PLoss: {policy_loss.item():7.4f} | "
+                    f"VLoss: {value_loss.item():10.2f} | "
+                    f"Entropy: {entropy_loss.item():6.3f} | "
+                    f"FPS: {fps:6.1f}" + vram_str
+                )
+
+                logger.log_scalar("train/reward", mean_reward, global_step)
+                logger.log_scalar("train/feasibility_rate", feas_rate, global_step)
+                logger.log_scalar("train/policy_loss", policy_loss.item(), global_step)
+                logger.log_scalar("train/value_loss", value_loss.item(), global_step)
+                logger.log_scalar("train/fps", fps, global_step)
 
             if global_step % model_cfg["training"]["save_interval"] == 0:
                 os.makedirs("checkpoints", exist_ok=True)
                 ckpt_path = f"checkpoints/tgnn_ppo_step_{global_step}.pt"
                 torch.save({"model_state": model.state_dict(), "step": global_step}, ckpt_path)
-                print(f"Checkpoint saved to {ckpt_path}")
+                print(f"--> Checkpoint saved to {ckpt_path}")
 
     finally:
         if hasattr(vec_env, "close"):
