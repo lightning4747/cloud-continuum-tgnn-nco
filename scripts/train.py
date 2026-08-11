@@ -73,6 +73,7 @@ def main():
     parser.add_argument("--device", type=str, default="auto", help="Device (auto, cuda, cuda:0, cpu)")
     parser.add_argument("--use-amp", action="store_true", default=True, help="Use Automatic Mixed Precision (AMP)")
     parser.add_argument("--no-parallel", action="store_true", help="Disable multiprocess env vectorization")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint (.pt) to resume training from")
     parser.add_argument("--dry-run", action="store_true", help="Dry run test mode")
     args = parser.parse_args()
 
@@ -105,6 +106,7 @@ def main():
     batch_size = 4 if args.dry_run else args.batch_size
     n_epochs = 1 if args.dry_run else model_cfg["ppo"]["n_epochs"]
     total_timesteps = 20 if args.dry_run else args.max_steps
+    save_interval = 20 if args.dry_run else model_cfg["training"]["save_interval"]
 
     print("=" * 80, flush=True)
     print(f"  TGNN-NCO High-Throughput PPO Training Engine", flush=True)
@@ -140,6 +142,24 @@ def main():
     logger = TrainingLogger(log_dir="runs/")
 
     global_step = 0
+    last_saved_step = 0
+
+    # Resume Training from Checkpoint if specified
+    if args.resume:
+        if os.path.exists(args.resume):
+            print(f"--> Resuming training from checkpoint '{args.resume}'...", flush=True)
+            ckpt = torch.load(args.resume, map_location=device)
+            model.load_state_dict(ckpt["model_state"])
+            if "optimizer_state" in ckpt and ckpt["optimizer_state"] is not None:
+                optimizer.load_state_dict(ckpt["optimizer_state"])
+            if use_amp and "scaler_state" in ckpt and ckpt["scaler_state"] is not None:
+                scaler.load_state_dict(ckpt["scaler_state"])
+            global_step = ckpt.get("global_step", ckpt.get("step", 0))
+            last_saved_step = global_step
+            print(f"--> Successfully resumed at Step {global_step:,} / {total_timesteps:,}", flush=True)
+        else:
+            print(f"WARNING: Resume checkpoint '{args.resume}' not found. Starting from scratch.", flush=True)
+
     print(">>> Starting Training Loop...", flush=True)
 
     try:
@@ -295,11 +315,33 @@ def main():
             logger.log_scalar("train/value_loss", value_loss.item(), global_step)
             logger.log_scalar("train/fps", fps, global_step)
 
-            if global_step % model_cfg["training"]["save_interval"] == 0:
+            # Periodic Checkpoint Saving via Interval Threshold
+            if global_step - last_saved_step >= save_interval:
+                last_saved_step = global_step
                 os.makedirs("checkpoints", exist_ok=True)
                 ckpt_path = f"checkpoints/tgnn_ppo_step_{global_step}.pt"
-                torch.save({"model_state": model.state_dict(), "step": global_step}, ckpt_path)
-                print(f"--> Checkpoint saved to {ckpt_path}", flush=True)
+                ckpt_data = {
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "scaler_state": scaler.state_dict() if use_amp else None,
+                    "global_step": global_step,
+                }
+                torch.save(ckpt_data, ckpt_path)
+                print(f"--> Periodic checkpoint saved to '{ckpt_path}'", flush=True)
+
+        # Guaranteed Final Checkpoint Saving Upon Completion
+        os.makedirs("checkpoints", exist_ok=True)
+        final_ckpt = "checkpoints/tgnn_ppo_final.pt"
+        step_ckpt = f"checkpoints/tgnn_ppo_step_{global_step}.pt"
+        final_ckpt_data = {
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "scaler_state": scaler.state_dict() if use_amp else None,
+            "global_step": global_step,
+        }
+        torch.save(final_ckpt_data, final_ckpt)
+        torch.save(final_ckpt_data, step_ckpt)
+        print(f"--> Final trained model saved to '{final_ckpt}' and '{step_ckpt}'", flush=True)
 
     finally:
         if hasattr(vec_env, "close"):
