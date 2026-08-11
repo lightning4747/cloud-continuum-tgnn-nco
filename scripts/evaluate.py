@@ -1,8 +1,7 @@
 import argparse
-import os
+import copy
 import sys
 from pathlib import Path
-import numpy as np
 import yaml
 
 # Ensure project root is in sys.path for absolute imports
@@ -14,11 +13,18 @@ from src.env.continuum_env import ContinuumEnv
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Placement Solvers")
-    parser.add_argument("--config", type=str, default="configs/evaluation_config.yaml", help="Path to eval config")
+    parser.add_argument("--config", type=str, default="configs/evaluation_config.yaml", help="Path to evaluation protocol config")
+    parser.add_argument("--env-config", type=str, default="configs/env_config.yaml", help="Path to environment config")
     parser.add_argument("--n-episodes", type=int, default=10, help="Number of test episodes")
     args = parser.parse_args()
 
-    env = ContinuumEnv(seed=123)
+    with open(args.config, "r") as f:
+        eval_cfg = yaml.safe_load(f)
+
+    n_episodes = args.n_episodes if args.n_episodes != 10 else eval_cfg.get("n_test_episodes", 10)
+    seed = eval_cfg.get("eval_seed", 123)
+
+    env = ContinuumEnv(cfg_or_path=args.env_config, seed=seed)
     solvers = {
         "GreedyFFD": GreedyFFD(),
         "GreedyLatencyAware": GreedyLatencyAware(),
@@ -26,14 +32,16 @@ def main():
 
     results = {name: [] for name in solvers}
 
-    print(f"Starting evaluation across {args.n_episodes} episodes...")
-    for ep in range(args.n_episodes):
-        obs, _ = env.reset(seed=123 + ep)
+    print(f"Starting evaluation across {n_episodes} episodes using env config '{args.env_config}'...")
+    for ep in range(n_episodes):
+        obs, _ = env.reset(seed=seed + ep)
         state = env.current_state
         sfcs = env.current_sfcs
 
         for name, solver in solvers.items():
-            placement, info = solver.solve(state, sfcs)
+            state_copy = copy.deepcopy(state)
+            sfcs_copy = copy.deepcopy(sfcs)
+            placement, info = solver.solve(state_copy, sfcs_copy)
             results[name].append(info["feasible"])
 
     print("\n--- Evaluation Results ---")
