@@ -6,10 +6,11 @@ from src.env.generator import TopologyGenerator
 
 
 def test_generator_reset_determinism():
-    gen1 = TopologyGenerator(seed=42)
+    env = ContinuumEnv(seed=42)
+    gen1 = TopologyGenerator(cfg=env.cfg, seed=42)
     state1, sfcs1 = gen1.reset(seed=42)
 
-    gen2 = TopologyGenerator(seed=42)
+    gen2 = TopologyGenerator(cfg=env.cfg, seed=42)
     state2, sfcs2 = gen2.reset(seed=42)
 
     np.testing.assert_allclose(state1.node_features, state2.node_features)

@@ -159,24 +159,33 @@ class ContinuumEnv(gym.Env):
         return mask
 
     def _check_capacity_constraints(self, placement: np.ndarray) -> tuple[bool, dict]:
-        node_cpu_demand = np.sum(placement * self.current_sfcs.cnf_cpu[:, None], axis=0)
-        node_ram_demand = np.sum(placement * self.current_sfcs.cnf_ram[:, None], axis=0)
-        node_stor_demand = np.sum(placement * self.current_sfcs.cnf_storage[:, None], axis=0)
+        m_cnt, c_cnt = placement.shape
+        cnf_cpu = self.current_sfcs.cnf_cpu[:m_cnt]
+        cnf_ram = self.current_sfcs.cnf_ram[:m_cnt]
+        cnf_stor = self.current_sfcs.cnf_storage[:m_cnt]
+        node_cpu = self.current_state.node_cpu[:c_cnt]
+        node_ram = self.current_state.node_ram[:c_cnt]
+        node_stor = self.current_state.node_storage[:c_cnt]
 
-        cpu_ok = np.all(node_cpu_demand <= self.current_state.node_cpu + 1e-5)
-        ram_ok = np.all(node_ram_demand <= self.current_state.node_ram + 1e-5)
-        stor_ok = np.all(node_stor_demand <= self.current_state.node_storage + 1e-5)
+        node_cpu_demand = np.sum(placement * cnf_cpu[:, None], axis=0)
+        node_ram_demand = np.sum(placement * cnf_ram[:, None], axis=0)
+        node_stor_demand = np.sum(placement * cnf_stor[:, None], axis=0)
+
+        cpu_ok = np.all(node_cpu_demand <= node_cpu + 1e-5)
+        ram_ok = np.all(node_ram_demand <= node_ram + 1e-5)
+        stor_ok = np.all(node_stor_demand <= node_stor + 1e-5)
 
         feasible = bool(cpu_ok and ram_ok and stor_ok)
         details = {
-            "cpu_violations": int(np.sum(node_cpu_demand > self.current_state.node_cpu + 1e-5)),
-            "ram_violations": int(np.sum(node_ram_demand > self.current_state.node_ram + 1e-5)),
-            "stor_violations": int(np.sum(node_stor_demand > self.current_state.node_storage + 1e-5)),
+            "cpu_violations": int(np.sum(node_cpu_demand > node_cpu + 1e-5)),
+            "ram_violations": int(np.sum(node_ram_demand > node_ram + 1e-5)),
+            "stor_violations": int(np.sum(node_stor_demand > node_stor + 1e-5)),
         }
         return feasible, details
 
     def _check_bw_constraints(self, placement: np.ndarray) -> tuple[bool, dict]:
-        link_flow = np.zeros((self.c_max, self.c_max), dtype=np.float32)
+        c_cnt = max(self.c_max, self.current_state.node_features.shape[0])
+        link_flow = np.zeros((c_cnt, c_cnt), dtype=np.float32)
         active_sfcs = np.where(self.current_sfcs.sfc_active)[0]
 
         for sid in active_sfcs:
@@ -187,6 +196,8 @@ class ContinuumEnv(gym.Env):
             for k in range(len(cnf_indices) - 1):
                 u_cnf = cnf_indices[k]
                 v_cnf = cnf_indices[k + 1]
+                if u_cnf >= placement.shape[0] or v_cnf >= placement.shape[0]:
+                    continue
 
                 node_u = int(np.argmax(placement[u_cnf]))
                 node_v = int(np.argmax(placement[v_cnf]))
@@ -219,9 +230,10 @@ class ContinuumEnv(gym.Env):
 
     def _compute_deployment_cost(self, placement: np.ndarray) -> float:
         cost_map = {0: self.cfg["cost_per_cpu"]["edge"], 1: self.cfg["cost_per_cpu"]["fog"], 2: self.cfg["cost_per_cpu"]["cloud"]}
-        node_costs = np.array([cost_map[int(self.current_state.node_layer[i])] for i in range(self.c_max)], dtype=np.float32)
+        m_cnt, c_cnt = placement.shape
+        node_costs = np.array([cost_map[int(self.current_state.node_layer[i])] for i in range(c_cnt)], dtype=np.float32)
 
-        cnf_cpus = self.current_sfcs.cnf_cpu * self.current_sfcs.cnf_active
+        cnf_cpus = (self.current_sfcs.cnf_cpu * self.current_sfcs.cnf_active)[:m_cnt]
         total_cost = float(np.sum(placement * cnf_cpus[:, None] * node_costs[None, :]))
         return total_cost
 
@@ -241,6 +253,8 @@ class ContinuumEnv(gym.Env):
             for k in range(len(cnf_indices) - 1):
                 u_cnf = cnf_indices[k]
                 v_cnf = cnf_indices[k + 1]
+                if u_cnf >= placement.shape[0] or v_cnf >= placement.shape[0]:
+                    continue
                 node_u = int(np.argmax(placement[u_cnf]))
                 node_v = int(np.argmax(placement[v_cnf]))
 
@@ -270,12 +284,16 @@ class ContinuumEnv(gym.Env):
         return r
 
     def _build_obs(self) -> dict:
-        edge_attr_mat = np.zeros((self.c_max * self.c_max, 3), dtype=np.float32)
+        c_cnt = self.current_state.node_features.shape[0]
+        edge_attr_mat = np.zeros((c_cnt * c_cnt, 3), dtype=np.float32)
         if len(self.current_state.edge_attr) > 0:
             src = self.current_state.edge_index[0]
             dst = self.current_state.edge_index[1]
-            flat_indices = src * self.c_max + dst
-            edge_attr_mat[flat_indices] = self.current_state.edge_attr
+            valid_mask = (src < c_cnt) & (dst < c_cnt)
+            src_v = src[valid_mask]
+            dst_v = dst[valid_mask]
+            flat_indices = src_v * c_cnt + dst_v
+            edge_attr_mat[flat_indices] = self.current_state.edge_attr[valid_mask]
 
         return {
             "node_features": self.current_state.node_features,
