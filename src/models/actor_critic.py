@@ -74,11 +74,18 @@ class ActorCritic(nn.Module):
             logits = self.logit_proj(combined).squeeze(-1)            # (B, M_max, C_max)
 
         if action_mask is not None:
-            if action_mask.shape[-1] > C_max:
-                action_mask = action_mask[..., :C_max]
-            elif action_mask.shape[-1] < C_max:
-                pad_len = C_max - action_mask.shape[-1]
-                action_mask = torch.cat([action_mask, torch.zeros_like(action_mask[..., :pad_len])], dim=-1)
+            if action_mask.shape[1] > M_max:
+                action_mask = action_mask[:, :M_max, :]
+            elif action_mask.shape[1] < M_max:
+                pad_m = M_max - action_mask.shape[1]
+                action_mask = torch.cat([action_mask, torch.zeros_like(action_mask[:, :pad_m, :])], dim=1)
+
+            if action_mask.shape[2] > C_max:
+                action_mask = action_mask[:, :, :C_max]
+            elif action_mask.shape[2] < C_max:
+                pad_c = C_max - action_mask.shape[2]
+                action_mask = torch.cat([action_mask, torch.zeros_like(action_mask[:, :, :pad_c])], dim=2)
+
             logits = apply_action_mask(logits, action_mask)
 
         dist = Categorical(logits=logits)

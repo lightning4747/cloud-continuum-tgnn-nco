@@ -11,6 +11,8 @@ import yaml
 # Ensure project root is in sys.path for absolute imports on Colab/remote executions
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.baselines.flat_rl import FlatRLActorCritic
+from src.baselines.static_gnn import StaticGNNActorCritic
 from src.env.parallel_vector_env import ParallelVectorContinuumEnv
 from src.env.vector_env import VectorContinuumEnv
 from src.models.actor_critic import ActorCritic
@@ -18,23 +20,56 @@ from src.utils.logger import TrainingLogger
 from src.utils.seed import set_seed
 
 
-def obs_batch_to_tensors(batched_obs: dict, edge_index_np: np.ndarray, device: torch.device):
+def obs_batch_to_tensors(batched_obs: dict, edge_index_np: np.ndarray, device: torch.device, disable_mask: bool = False, C_max: int = 50, M_max: int = 150):
     """
-    Converts batched observation dict arrays into PyTorch Tensors on target device
-    using pinned memory and non-blocking CUDA transfers.
+    Converts batched observation dict arrays into PyTorch Tensors on target device,
+    ensuring fixed (B, C_max, F) and (B, M_max, F) dimensions.
     """
-    if device.type == "cuda":
-        node_feats = torch.from_numpy(batched_obs["node_features"]).float().pin_memory().to(device, non_blocking=True)
-        edge_idx = torch.from_numpy(edge_index_np).long().pin_memory().to(device, non_blocking=True)
-        node_hist = torch.from_numpy(batched_obs["node_history"]).float().pin_memory().to(device, non_blocking=True)
-        cnf_feats = torch.from_numpy(batched_obs["cnf_features"]).float().pin_memory().to(device, non_blocking=True)
-        action_mask = torch.from_numpy(batched_obs["action_mask"]).bool().pin_memory().to(device, non_blocking=True)
+    nf = batched_obs["node_features"]
+    nh = batched_obs["node_history"]
+    cf = batched_obs["cnf_features"]
+    am = batched_obs["action_mask"]
+
+    B = nf.shape[0]
+
+    # Node Features & History (B, C_max, ...)
+    if nf.shape[1] > C_max:
+        nf = nf[:, :C_max, :]
+        nh = nh[:, :, :C_max, :]
+    elif nf.shape[1] < C_max:
+        pad_c = C_max - nf.shape[1]
+        nf = np.pad(nf, ((0, 0), (0, pad_c), (0, 0)), mode="constant")
+        nh = np.pad(nh, ((0, 0), (0, 0), (0, pad_c), (0, 0)), mode="constant")
+
+    # CNF Features (B, M_max, ...)
+    if cf.shape[1] > M_max:
+        cf = cf[:, :M_max, :]
+    elif cf.shape[1] < M_max:
+        pad_m = M_max - cf.shape[1]
+        cf = np.pad(cf, ((0, 0), (0, pad_m), (0, 0)), mode="constant")
+
+    # Action Mask (B, M_max, C_max)
+    if am.shape[1] > M_max:
+        am = am[:, :M_max, :]
+    elif am.shape[1] < M_max:
+        pad_m = M_max - am.shape[1]
+        am = np.pad(am, ((0, 0), (0, pad_m), (0, 0)), mode="constant")
+
+    if am.shape[2] > C_max:
+        am = am[:, :, :C_max]
+    elif am.shape[2] < C_max:
+        pad_c = C_max - am.shape[2]
+        am = np.pad(am, ((0, 0), (0, 0), (0, pad_c)), mode="constant")
+
+    node_feats = torch.from_numpy(nf).float().to(device)
+    edge_idx = torch.from_numpy(edge_index_np).long().to(device)
+    node_hist = torch.from_numpy(nh).float().to(device)
+    cnf_feats = torch.from_numpy(cf).float().to(device)
+
+    if disable_mask:
+        action_mask = torch.ones_like(torch.from_numpy(am)).bool().to(device)
     else:
-        node_feats = torch.from_numpy(batched_obs["node_features"]).float().to(device)
-        edge_idx = torch.from_numpy(edge_index_np).long().to(device)
-        node_hist = torch.from_numpy(batched_obs["node_history"]).float().to(device)
-        cnf_feats = torch.from_numpy(batched_obs["cnf_features"]).float().to(device)
-        action_mask = torch.from_numpy(batched_obs["action_mask"]).bool().to(device)
+        action_mask = torch.from_numpy(am).bool().to(device)
 
     return node_feats, edge_idx, node_hist, cnf_feats, action_mask
 
@@ -65,6 +100,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train High-Throughput TGNN-NCO PPO Placement Policy")
     parser.add_argument("--config", type=str, default="configs/model_config.yaml", help="Path to model config")
     parser.add_argument("--env-config", type=str, default="configs/env_config.yaml", help="Path to env config")
+    parser.add_argument("--model", type=str, default="tgnn", choices=["tgnn", "static_gnn", "flat_rl"], help="Model architecture variant")
+    parser.add_argument("--disable-mask", action="store_true", help="Disable action masking for ablation study")
     parser.add_argument("--num-envs", type=int, default=32, help="Number of parallel vectorized environments")
     parser.add_argument("--batch-size", type=int, default=512, help="PPO mini-batch size for GPU optimization")
     parser.add_argument("--d-model", type=int, default=256, help="Embedding dimension (d_model)")
@@ -110,6 +147,8 @@ def main():
 
     print("=" * 80, flush=True)
     print(f"  TGNN-NCO High-Throughput PPO Training Engine", flush=True)
+    print(f"  Model Architecture  : {args.model.upper()}", flush=True)
+    print(f"  Action Masking      : {'Disabled (No-Mask Ablation)' if args.disable_mask else 'Enabled'}", flush=True)
     print(f"  Target Device       : {device_str.upper()}", flush=True)
     print(f"  Automatic Precision : {'AMP FP16' if use_amp else 'FP32'}", flush=True)
     print(f"  Parallel Vector Envs: {'Disabled' if args.no_parallel or args.dry_run else f'Enabled ({num_envs} envs)'}", flush=True)
@@ -136,8 +175,14 @@ def main():
     else:
         edge_index_np = np.array([[0, 1], [1, 0]], dtype=np.int64)
 
-    print("[3/3] Initializing TGNN Policy Network...", flush=True)
-    model = ActorCritic(model_cfg).to(device)
+    print(f"[3/3] Initializing {args.model.upper()} Policy Network...", flush=True)
+    if args.model == "static_gnn":
+        model = StaticGNNActorCritic(model_cfg).to(device)
+    elif args.model == "flat_rl":
+        model = FlatRLActorCritic(model_cfg).to(device)
+    else:
+        model = ActorCritic(model_cfg).to(device)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=float(model_cfg["ppo"]["learning_rate"]))
     logger = TrainingLogger(log_dir="runs/")
 
@@ -182,7 +227,7 @@ def main():
             # 1. Parallel Rollout Collection Loop
             for step in range(n_steps):
                 global_step += num_envs
-                node_f, edge_i, node_h, cnf_f, mask = obs_batch_to_tensors(batched_obs, edge_index_np, device)
+                node_f, edge_i, node_h, cnf_f, mask = obs_batch_to_tensors(batched_obs, edge_index_np, device, disable_mask=args.disable_mask)
 
                 with torch.no_grad():
                     with torch.amp.autocast("cuda", enabled=use_amp):
@@ -212,7 +257,7 @@ def main():
 
             # 2. Vectorized GAE Advantage Computation
             with torch.no_grad():
-                node_f_next, edge_i_next, node_h_next, cnf_f_next, _ = obs_batch_to_tensors(batched_obs, edge_index_np, device)
+                node_f_next, edge_i_next, node_h_next, cnf_f_next, _ = obs_batch_to_tensors(batched_obs, edge_index_np, device, disable_mask=args.disable_mask)
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     next_vals = model.get_value(node_f_next, edge_i_next, node_h_next, cnf_f_next).squeeze(-1).cpu().numpy()
 
@@ -319,29 +364,37 @@ def main():
             if global_step - last_saved_step >= save_interval:
                 last_saved_step = global_step
                 os.makedirs("checkpoints", exist_ok=True)
-                ckpt_path = f"checkpoints/tgnn_ppo_step_{global_step}.pt"
+                ckpt_name = f"{args.model}_ppo_step_{global_step}.pt" if args.model != "tgnn" else f"tgnn_ppo_step_{global_step}.pt"
+                if args.disable_mask:
+                    ckpt_name = f"nomask_ppo_step_{global_step}.pt"
+                ckpt_path = os.path.join("checkpoints", ckpt_name)
                 ckpt_data = {
                     "model_state": model.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "scaler_state": scaler.state_dict() if use_amp else None,
                     "global_step": global_step,
+                    "model_variant": args.model,
+                    "disable_mask": args.disable_mask,
                 }
                 torch.save(ckpt_data, ckpt_path)
                 print(f"--> Periodic checkpoint saved to '{ckpt_path}'", flush=True)
 
         # Guaranteed Final Checkpoint Saving Upon Completion
         os.makedirs("checkpoints", exist_ok=True)
-        final_ckpt = "checkpoints/tgnn_ppo_final.pt"
-        step_ckpt = f"checkpoints/tgnn_ppo_step_{global_step}.pt"
+        final_name = f"{args.model}_ppo_final.pt" if args.model != "tgnn" else "tgnn_ppo_final.pt"
+        if args.disable_mask:
+            final_name = "nomask_ppo_final.pt"
+        final_ckpt = os.path.join("checkpoints", final_name)
         final_ckpt_data = {
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "scaler_state": scaler.state_dict() if use_amp else None,
             "global_step": global_step,
+            "model_variant": args.model,
+            "disable_mask": args.disable_mask,
         }
         torch.save(final_ckpt_data, final_ckpt)
-        torch.save(final_ckpt_data, step_ckpt)
-        print(f"--> Final trained model saved to '{final_ckpt}' and '{step_ckpt}'", flush=True)
+        print(f"--> Final trained model saved to '{final_ckpt}'", flush=True)
 
     finally:
         if hasattr(vec_env, "close"):

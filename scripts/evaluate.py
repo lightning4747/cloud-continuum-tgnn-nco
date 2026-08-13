@@ -13,6 +13,7 @@ import yaml
 # Ensure project root is in sys.path for absolute imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.baselines.flat_rl import FlatRLActorCritic
 from src.baselines.greedy import GreedyFFD, GreedyLatencyAware
 from src.baselines.minlp_solver import MINLPSolver
 from src.baselines.static_gnn import StaticGNNActorCritic
@@ -20,7 +21,7 @@ from src.env.continuum_env import ContinuumEnv
 from src.models.actor_critic import ActorCritic
 
 
-def obs_to_tensors(obs: dict, edge_index_np: np.ndarray, device: torch.device):
+def obs_to_tensors(obs: dict, edge_index_np: np.ndarray, device: torch.device, disable_mask: bool = False):
     """
     Converts single observation dict to PyTorch tensors with batch dimension B=1.
     """
@@ -28,7 +29,10 @@ def obs_to_tensors(obs: dict, edge_index_np: np.ndarray, device: torch.device):
     edge_i = torch.from_numpy(edge_index_np).long().to(device)
     node_h = torch.from_numpy(obs["node_history"]).unsqueeze(0).float().to(device)
     cnf_f = torch.from_numpy(obs["cnf_features"]).unsqueeze(0).float().to(device)
-    mask = torch.from_numpy(obs["action_mask"]).unsqueeze(0).bool().to(device)
+    if disable_mask:
+        mask = torch.ones_like(torch.from_numpy(obs["action_mask"])).unsqueeze(0).bool().to(device)
+    else:
+        mask = torch.from_numpy(obs["action_mask"]).unsqueeze(0).bool().to(device)
     return node_f, edge_i, node_h, cnf_f, mask
 
 
@@ -38,6 +42,9 @@ def main():
     parser.add_argument("--env-config", type=str, default="configs/env_config.yaml", help="Path to environment config")
     parser.add_argument("--model-config", type=str, default="configs/model_config.yaml", help="Path to model config")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/tgnn_ppo_step_200704.pt", help="Path to trained TGNN-NCO checkpoint (.pt)")
+    parser.add_argument("--static-gnn-checkpoint", type=str, default=None, help="Path to trained Static-GNN checkpoint")
+    parser.add_argument("--flat-rl-checkpoint", type=str, default=None, help="Path to trained Flat-RL checkpoint")
+    parser.add_argument("--nomask-checkpoint", type=str, default=None, help="Path to trained No-Mask checkpoint")
     parser.add_argument("--n-episodes", type=int, default=10, help="Number of test episodes per scenario")
     parser.add_argument("--results-dir", type=str, default="results", help="Directory to save CSV and JSON results")
     args = parser.parse_args()
@@ -54,26 +61,52 @@ def main():
     n_episodes = args.n_episodes
     seed = eval_cfg.get("eval_seed", 123)
 
-    # 1. Load Trained TGNN-NCO Model Checkpoint
-    tgnn_model = None
+    # 1. Load Trained Policy Checkpoints
+    solvers = {
+        "GreedyFFD": GreedyFFD(),
+        "GreedyLatencyAware": GreedyLatencyAware(),
+        "MINLP": MINLPSolver(timeout=10),
+    }
+
+    # Full TGNN-NCO
     if os.path.exists(args.checkpoint):
         print(f"--> Loading trained TGNN-NCO policy checkpoint from '{args.checkpoint}' on {device}...")
         tgnn_model = ActorCritic(model_cfg).to(device)
         ckpt = torch.load(args.checkpoint, map_location=device)
         tgnn_model.load_state_dict(ckpt.get("model_state", ckpt))
         tgnn_model.eval()
-    else:
-        print(f"WARNING: Checkpoint '{args.checkpoint}' not found. Evaluating baselines only.")
-
-    # 2. Instantiate Baseline Solvers
-    solvers = {
-        "GreedyFFD": GreedyFFD(),
-        "GreedyLatencyAware": GreedyLatencyAware(),
-        "Static-GNN": StaticGNNActorCritic(model_cfg).to(device),
-        "MINLP": MINLPSolver(timeout=10),
-    }
-    if tgnn_model is not None:
         solvers["TGNN-NCO"] = tgnn_model
+
+    # Static-GNN
+    if args.static_gnn_checkpoint and os.path.exists(args.static_gnn_checkpoint):
+        print(f"--> Loading trained Static-GNN checkpoint from '{args.static_gnn_checkpoint}'...")
+        sgnn_model = StaticGNNActorCritic(model_cfg).to(device)
+        ckpt = torch.load(args.static_gnn_checkpoint, map_location=device)
+        sgnn_model.load_state_dict(ckpt.get("model_state", ckpt))
+        sgnn_model.eval()
+        solvers["Static-GNN"] = sgnn_model
+    else:
+        solvers["Static-GNN"] = StaticGNNActorCritic(model_cfg).to(device)
+
+    # Flat-RL
+    if args.flat_rl_checkpoint and os.path.exists(args.flat_rl_checkpoint):
+        print(f"--> Loading trained Flat-RL checkpoint from '{args.flat_rl_checkpoint}'...")
+        frl_model = FlatRLActorCritic(model_cfg).to(device)
+        ckpt = torch.load(args.flat_rl_checkpoint, map_location=device)
+        frl_model.load_state_dict(ckpt.get("model_state", ckpt))
+        frl_model.eval()
+        solvers["Flat-RL"] = frl_model
+    else:
+        solvers["Flat-RL"] = FlatRLActorCritic(model_cfg).to(device)
+
+    # No-Mask
+    if args.nomask_checkpoint and os.path.exists(args.nomask_checkpoint):
+        print(f"--> Loading trained No-Mask checkpoint from '{args.nomask_checkpoint}'...")
+        nomask_model = ActorCritic(model_cfg).to(device)
+        ckpt = torch.load(args.nomask_checkpoint, map_location=device)
+        nomask_model.load_state_dict(ckpt.get("model_state", ckpt))
+        nomask_model.eval()
+        solvers["No-Mask"] = nomask_model
 
     scenarios = {
         "In-Distribution": {"c_range": [20, 50], "m_range": [40, 150]},
@@ -110,24 +143,9 @@ def main():
                 state_copy = copy.deepcopy(state)
                 sfcs_copy = copy.deepcopy(sfcs)
 
-                if s_name == "TGNN-NCO":
-                    node_f, edge_i, node_h, cnf_f, mask = obs_to_tensors(obs, edge_index_np, device)
-                    t0 = time.perf_counter()
-                    with torch.no_grad():
-                        actions, _, _, _ = solver.get_action_and_value(node_f, edge_i, node_h, cnf_f, action_mask=mask)
-                    t_ms = (time.perf_counter() - t0) * 1000.0
-                    action_np = actions.squeeze(0).cpu().numpy()
-                    _, reward, term, trunc, info = env.step(action_np)
-
-                    sc_metrics[s_name].append({
-                        "feasible": info["feasible"],
-                        "cost": info["deployment_cost"],
-                        "mean_latency": info["mean_e2e_latency"],
-                        "time_ms": t_ms,
-                    })
-
-                elif s_name == "Static-GNN":
-                    node_f, edge_i, node_h, cnf_f, mask = obs_to_tensors(obs, edge_index_np, device)
+                if isinstance(solver, torch.nn.Module):
+                    disable_m = (s_name == "No-Mask")
+                    node_f, edge_i, node_h, cnf_f, mask = obs_to_tensors(obs, edge_index_np, device, disable_mask=disable_m)
                     t0 = time.perf_counter()
                     with torch.no_grad():
                         actions, _, _, _ = solver.get_action_and_value(node_f, edge_i, node_h, cnf_f, action_mask=mask)

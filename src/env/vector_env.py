@@ -61,5 +61,15 @@ class VectorContinuumEnv:
     def _stack_obs(self, obs_list: list[dict]) -> dict:
         batched_obs = {}
         for key in obs_list[0].keys():
-            batched_obs[key] = np.stack([obs[key] for obs in obs_list], axis=0)
+            shapes = [obs[key].shape for obs in obs_list]
+            if all(s == shapes[0] for s in shapes):
+                batched_obs[key] = np.stack([obs[key] for obs in obs_list], axis=0)
+            else:
+                max_dims = [max(s[i] for s in shapes) for i in range(len(shapes[0]))]
+                padded_list = []
+                for obs in obs_list:
+                    arr = obs[key]
+                    pad_width = [(0, max_dims[i] - arr.shape[i]) for i in range(len(arr.shape))]
+                    padded_list.append(np.pad(arr, pad_width, mode="constant"))
+                batched_obs[key] = np.stack(padded_list, axis=0)
         return batched_obs
