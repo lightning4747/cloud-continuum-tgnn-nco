@@ -88,6 +88,7 @@ class ActorCritic(nn.Module):
 
             logits = apply_action_mask(logits, action_mask)
 
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
         dist = Categorical(logits=logits)
 
         # Critic Value
