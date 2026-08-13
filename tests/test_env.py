@@ -3,6 +3,7 @@ import pytest
 
 from src.env.continuum_env import ContinuumEnv
 from src.env.generator import TopologyGenerator
+from src.env.parallel_vector_env import ParallelVectorContinuumEnv
 
 
 def test_generator_reset_determinism():
@@ -67,3 +68,21 @@ def test_1000_step_rollout_stability():
         obs, reward, terminated, truncated, info = env.step(action)
         if truncated:
             obs, _ = env.reset()
+
+
+def test_parallel_vector_env():
+    pvec = ParallelVectorContinuumEnv(num_envs=4, seed=42)
+    obs_b, _ = pvec.reset(seed=42)
+
+    assert obs_b["node_features"].shape[0] == 4
+    assert obs_b["cnf_features"].shape[0] == 4
+    assert obs_b["action_mask"].shape[0] == 4
+
+    actions = np.zeros((4, obs_b["action_mask"].shape[1]), dtype=np.int64)
+    next_obs_b, rewards, terminateds, truncateds, infos = pvec.step(actions)
+
+    assert rewards.shape == (4,)
+    assert terminateds.shape == (4,)
+    assert truncateds.shape == (4,)
+    assert len(infos) == 4
+    pvec.close()
