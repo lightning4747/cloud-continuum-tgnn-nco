@@ -281,6 +281,7 @@ def main():
 
             flat_advantages = advantages_tensor.reshape(-1)
             flat_returns = returns_tensor.reshape(-1)
+            flat_old_values = torch.tensor(values_mat, dtype=torch.float32).reshape(-1).to(device)
 
             # Advantage Normalization
             flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-8)
@@ -306,18 +307,29 @@ def main():
                     mb_old_lp = flat_old_log_probs[mb_idx]
                     mb_adv = flat_advantages[mb_idx]
                     mb_ret = flat_returns[mb_idx]
+                    mb_old_val = flat_old_values[mb_idx]
 
                     with torch.amp.autocast("cuda", enabled=use_amp):
                         _, new_log_prob, new_entropy, new_value = model.get_action_and_value(
                             mb_node_f, edge_i_shared, mb_node_h, mb_cnf_f, action_mask=mb_mask, action=mb_act
                         )
 
+                        clip_eps = float(model_cfg["ppo"]["clip_epsilon"])
+
+                        # Policy Loss
                         ratio = torch.exp(new_log_prob - mb_old_lp)
                         surr1 = ratio * mb_adv
-                        surr2 = torch.clamp(ratio, 1.0 - float(model_cfg["ppo"]["clip_epsilon"]), 1.0 + float(model_cfg["ppo"]["clip_epsilon"])) * mb_adv
-
+                        surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * mb_adv
                         policy_loss = -torch.min(surr1, surr2).mean()
-                        value_loss = F.mse_loss(new_value.squeeze(-1), mb_ret)
+
+                        # PPO Clipped Value Loss (L_VF_clip)
+                        v_pred = new_value.squeeze(-1)
+                        v_loss_unclipped = (v_pred - mb_ret) ** 2
+                        v_clipped = mb_old_val + torch.clamp(v_pred - mb_old_val, -clip_eps, clip_eps)
+                        v_loss_clipped = (v_clipped - mb_ret) ** 2
+                        value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                        value_loss = torch.clamp(value_loss, max=1000.0)
+
                         entropy_loss = -new_entropy.mean()
 
                         loss = (policy_loss

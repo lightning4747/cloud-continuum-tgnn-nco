@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 import numpy as np
 from src.env.continuum_env import ContinuumEnv
+from src.utils.reward_wrapper import VecRewardScaler
 
 
 class ParallelVectorContinuumEnv:
@@ -22,6 +23,7 @@ class ParallelVectorContinuumEnv:
         self.c_max = self.envs[0].c_max
         self.m_max = self.envs[0].m_max
         self.w = self.envs[0].w
+        self.reward_scaler = VecRewardScaler(num_envs=num_envs)
 
     def reset(self, seed: int = 42) -> tuple[dict, list[dict]]:
         def _reset_env(args):
@@ -31,6 +33,7 @@ class ParallelVectorContinuumEnv:
         results = list(self.executor.map(_reset_env, enumerate(self.envs)))
         obs_list, info_list = zip(*results)
 
+        self.reward_scaler.reset()
         batched_obs = self._stack_obs(obs_list)
         return batched_obs, list(info_list)
 
@@ -48,10 +51,14 @@ class ParallelVectorContinuumEnv:
         results = list(self.executor.map(_step_env, enumerate(self.envs)))
         obs_list, rewards, terminateds, truncateds, info_list = zip(*results)
 
+        raw_rewards_np = np.array(rewards, dtype=np.float32)
+        dones_np = np.array(terminateds, dtype=bool) | np.array(truncateds, dtype=bool)
+        scaled_rewards = self.reward_scaler.transform(raw_rewards_np, dones_np)
+
         batched_obs = self._stack_obs(obs_list)
         return (
             batched_obs,
-            np.array(rewards, dtype=np.float32),
+            scaled_rewards,
             np.array(terminateds, dtype=bool),
             np.array(truncateds, dtype=bool),
             list(info_list),
