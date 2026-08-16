@@ -5,6 +5,7 @@ import numpy as np
 from scipy.sparse.csgraph import floyd_warshall
 import yaml
 
+from src.env.exogenous_trace import ExogenousTrace
 from src.env.generator import NetworkState, SFCBatch, TopologyGenerator
 from src.env.state_buffer import TemporalStateBuffer
 
@@ -12,7 +13,7 @@ from src.env.state_buffer import TemporalStateBuffer
 class ContinuumEnv(gym.Env):
     """
     Gymnasium-compliant environment for dynamic CNF placement on the Cloud-Continuum.
-    Optimized with precomputed Floyd-Warshall routing matrices for fast environment steps.
+    Features stateful resource commitment, TTL-based SFC retirement, and deterministic ExogenousTrace support.
     """
 
     metadata = {"render_modes": []}
@@ -53,10 +54,18 @@ class ContinuumEnv(gym.Env):
         self._dist_matrix = None
         self._pred_matrix = None
 
+        # Resource allocation tracking
+        self.node_cpu_allocated = np.zeros(self.c_max, dtype=np.float32)
+        self.node_ram_allocated = np.zeros(self.c_max, dtype=np.float32)
+        self.node_storage_allocated = np.zeros(self.c_max, dtype=np.float32)
+        self.edge_bw_allocated = np.zeros((self.c_max, self.c_max), dtype=np.float32)
+
+        # Placed SFC resource allocation map: sfc_id -> dict of allocations
+        self.placed_sfc_allocations: dict[int, dict] = {}
+
     def _update_shortest_paths(self):
         """
         Precomputes all-pairs shortest path distance and predecessor matrices using Floyd-Warshall.
-        Executed once per topology state update for fast O(1) routing lookups.
         """
         n_act = self.current_state.n_active_nodes
         adj = np.full((n_act, n_act), np.inf, dtype=np.float64)
@@ -73,10 +82,18 @@ class ContinuumEnv(gym.Env):
         self._dist_matrix = dist
         self._pred_matrix = pred
 
-    def reset(self, seed: int | None = None, options: dict | None = None) -> tuple[dict, dict]:
+    def reset(self, seed: int | None = None, exogenous_trace: ExogenousTrace | None = None, options: dict | None = None) -> tuple[dict, dict]:
         super().reset(seed=seed)
         self.current_step = 0
-        self.current_state, self.current_sfcs = self.generator.reset(seed=seed)
+
+        # Clear allocation trackers
+        self.node_cpu_allocated.fill(0.0)
+        self.node_ram_allocated.fill(0.0)
+        self.node_storage_allocated.fill(0.0)
+        self.edge_bw_allocated.fill(0.0)
+        self.placed_sfc_allocations.clear()
+
+        self.current_state, self.current_sfcs = self.generator.reset(seed=seed, exogenous_trace=exogenous_trace)
         self.state_buffer.reset(self.current_state)
         self._update_shortest_paths()
 
@@ -96,24 +113,57 @@ class ContinuumEnv(gym.Env):
         self.current_step += 1
         placement_matrix = self._decode_action(action)
 
-        # Check hard capacity & resource constraints
+        # 1. Check hard capacity & resource constraints against current available state
         cap_feasible, cap_details = self._check_capacity_constraints(placement_matrix)
         bw_feasible, bw_details = self._check_bw_constraints(placement_matrix)
         feasible = cap_feasible and bw_feasible
 
-        # Compute costs and penalties
+        # 2. Compute costs and penalties
         cost = self._compute_deployment_cost(placement_matrix)
         latency_penalty, e2e_latencies = self._compute_latency_penalty(placement_matrix)
         reward = self._compute_reward(cost, latency_penalty, feasible)
 
-        # Advance environment state
-        self.current_state, self.current_sfcs = self.generator.step(self.current_state, self.current_sfcs)
+        # 3. Commit Resource Allocations if capacity feasible
+        if cap_feasible:
+            self._commit_resource_allocations(placement_matrix)
+
+        # 4. Push current state t to state buffer BEFORE advancing state to t+1
         self.state_buffer.push(self.current_state)
+
+        # 5. Advance environment state to t+1 and retrieve retired SFCs
+        self.current_state, self.current_sfcs, retired_sfcs = self.generator.step(
+            self.current_state,
+            self.node_cpu_allocated,
+            self.node_ram_allocated,
+            self.node_storage_allocated,
+            self.edge_bw_allocated,
+        )
+
+        # 6. Release resources for retired SFCs
+        for sfc in retired_sfcs:
+            sid = sfc["sfc_id"]
+            if sid in self.placed_sfc_allocations:
+                alloc = self.placed_sfc_allocations.pop(sid)
+                for node_idx, cpu_d, ram_d, stor_d in alloc["node_allocs"]:
+                    self.node_cpu_allocated[node_idx] = max(0.0, self.node_cpu_allocated[node_idx] - cpu_d)
+                    self.node_ram_allocated[node_idx] = max(0.0, self.node_ram_allocated[node_idx] - ram_d)
+                    self.node_storage_allocated[node_idx] = max(0.0, self.node_storage_allocated[node_idx] - stor_d)
+
+                for u, v, rate in alloc["bw_allocs"]:
+                    self.edge_bw_allocated[u, v] = max(0.0, self.edge_bw_allocated[u, v] - rate)
+                    self.edge_bw_allocated[v, u] = max(0.0, self.edge_bw_allocated[v, u] - rate)
+
         self._update_shortest_paths()
 
+        # Build observation (node_features is state t+1, node_history is [t-W+1 ... t])
         obs = self._build_obs()
         truncated = self.current_step >= self.max_steps
         terminated = False  # Continuous scheduling environment
+
+        # Calculate average resource utilization %
+        n_act = self.current_state.n_active_nodes
+        cpu_tot = np.sum(self.current_state.node_cpu_total[:n_act]) if self.current_state.node_cpu_total is not None else 1.0
+        cpu_util_pct = (np.sum(self.node_cpu_allocated[:n_act]) / max(cpu_tot, 1e-5)) * 100.0
 
         info = {
             "feasible": feasible,
@@ -124,9 +174,67 @@ class ContinuumEnv(gym.Env):
             "mean_e2e_latency": float(np.mean(list(e2e_latencies.values()))) if e2e_latencies else 0.0,
             "cap_details": cap_details,
             "bw_details": bw_details,
+            "cpu_utilization_pct": float(cpu_util_pct),
+            "n_active_sfcs": self.current_sfcs.n_active_sfcs,
         }
 
         return obs, reward, terminated, truncated, info
+
+    def _commit_resource_allocations(self, placement: np.ndarray):
+        active_sfcs = np.where(self.current_sfcs.sfc_active)[0]
+
+        for sid in active_sfcs:
+            cnf_indices = np.where((self.current_sfcs.sfc_id == sid) & self.current_sfcs.cnf_active)[0]
+            if len(cnf_indices) == 0:
+                continue
+
+            node_allocs = []
+            bw_allocs = []
+
+            for u_cnf in cnf_indices:
+                if u_cnf >= placement.shape[0]:
+                    continue
+                node_u = int(np.argmax(placement[u_cnf]))
+                cpu_d = float(self.current_sfcs.cnf_cpu[u_cnf])
+                ram_d = float(self.current_sfcs.cnf_ram[u_cnf])
+                stor_d = float(self.current_sfcs.cnf_storage[u_cnf])
+
+                self.node_cpu_allocated[node_u] += cpu_d
+                self.node_ram_allocated[node_u] += ram_d
+                self.node_storage_allocated[node_u] += stor_d
+                node_allocs.append((node_u, cpu_d, ram_d, stor_d))
+
+            # Inter-CNF bandwidth path commitments
+            for k in range(len(cnf_indices) - 1):
+                u_cnf = cnf_indices[k]
+                v_cnf = cnf_indices[k + 1]
+                if u_cnf >= placement.shape[0] or v_cnf >= placement.shape[0]:
+                    continue
+                node_u = int(np.argmax(placement[u_cnf]))
+                node_v = int(np.argmax(placement[v_cnf]))
+                rate = float(self.current_sfcs.cnf_rate[u_cnf])
+
+                if node_u != node_v and node_u < self._dist_matrix.shape[0] and node_v < self._dist_matrix.shape[0]:
+                    if not np.isinf(self._dist_matrix[node_u, node_v]):
+                        curr = node_v
+                        path = [curr]
+                        while curr != node_u:
+                            curr = self._pred_matrix[node_u, curr]
+                            if curr == -9999 or curr < 0:
+                                break
+                            path.append(curr)
+                        path.reverse()
+
+                        for p in range(len(path) - 1):
+                            pu, pv = path[p], path[p + 1]
+                            self.edge_bw_allocated[pu, pv] += rate
+                            self.edge_bw_allocated[pv, pu] += rate
+                            bw_allocs.append((pu, pv, rate))
+
+            self.placed_sfc_allocations[int(sid)] = {
+                "node_allocs": node_allocs,
+                "bw_allocs": bw_allocs,
+            }
 
     def _decode_action(self, action: np.ndarray) -> np.ndarray:
         placement = np.zeros((self.m_max, self.c_max), dtype=np.float32)
@@ -140,7 +248,6 @@ class ContinuumEnv(gym.Env):
         mask = np.zeros((self.m_max, self.c_max), dtype=int)
         for m in range(self.m_max):
             if not self.current_sfcs.cnf_active[m]:
-                # Inactive CNF slots assigned to node 0 mask
                 mask[m, 0] = 1
                 continue
 
@@ -159,11 +266,10 @@ class ContinuumEnv(gym.Env):
                 ):
                     mask[m, i] = 1
             if mask[m].sum() == 0:
-                # Unmask all active nodes for exploration when no valid placement exists
                 for i in range(self.c_max):
                     if i < len(self.current_state.node_active) and self.current_state.node_active[i]:
                         mask[m, i] = 1
-                if mask[m].sum() == 0:  # Final guard if no active nodes at all
+                if mask[m].sum() == 0:
                     mask[m, 0] = 1
         return mask
 
@@ -220,12 +326,11 @@ class ContinuumEnv(gym.Env):
                     ):
                         return False, {"bw_violations": 1, "no_path": True}
 
-                    # Reconstruct path using predecessor matrix
                     curr = node_v
                     path = [curr]
                     while curr != node_u:
                         curr = self._pred_matrix[node_u, curr]
-                        if curr == -9999 or curr < 0:  # Invalid predecessor
+                        if curr == -9999 or curr < 0:
                             return False, {"bw_violations": 1, "no_path": True}
                         path.append(curr)
                     path.reverse()
@@ -273,7 +378,7 @@ class ContinuumEnv(gym.Env):
                         or node_v >= self._dist_matrix.shape[0]
                         or np.isinf(self._dist_matrix[node_u, node_v])
                     ):
-                        trans_delay += 500.0  # Path failure penalty
+                        trans_delay += 500.0
                     else:
                         trans_delay += float(self._dist_matrix[node_u, node_v])
 

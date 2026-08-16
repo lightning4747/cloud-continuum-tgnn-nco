@@ -67,6 +67,9 @@ class TGNNEncoder(nn.Module):
     """
     Spatio-Temporal Graph Neural Network Encoder.
     Combines SpatialGNN over W history steps with GRU temporal aggregation.
+    Operates on sliding window [t-W+1, ..., t, t+1] of distinct chronological snapshots.
+    Uses window-based GRU sequence aggregation (stateless h0=0 per forward pass)
+    conforming to PPO sliding-window framed-history design.
     """
 
     def __init__(self, cfg: dict):
@@ -97,15 +100,15 @@ class TGNNEncoder(nn.Module):
 
     def forward(
         self,
-        node_features: torch.Tensor,   # (B, C_max, F_node)
+        node_features: torch.Tensor,   # (B, C_max, F_node) - Current state t+1
         edge_index: torch.Tensor,      # (2, E)
-        node_history: torch.Tensor,    # (B, W, C_max, F_node)
+        node_history: torch.Tensor,    # (B, W, C_max, F_node) - Past states [t-W+1 ... t]
         cnf_features: torch.Tensor,    # (B, M_max, F_cnf)
     ) -> tuple[torch.Tensor, torch.Tensor]:
         B, C_max, _ = node_features.shape
         _, W, _, _ = node_history.shape
 
-        # 1. Spatial Encoding across (W + 1) timesteps
+        # 1. Spatial Encoding across (W + 1) distinct chronological timesteps [t-W+1, ..., t, t+1]
         spatial_embeddings = []
         for t in range(W):
             h_t = self.spatial_gnn(node_history[:, t, :, :], edge_index)  # (B, C_max, d_hidden)
@@ -117,8 +120,7 @@ class TGNNEncoder(nn.Module):
         # Stack over time: (B, W+1, C_max, d_hidden)
         seq = torch.stack(spatial_embeddings, dim=1)
 
-        # 2. GRU Temporal Aggregation
-        # Reshape to (B * C_max, W+1, d_hidden)
+        # 2. GRU Temporal Aggregation over non-duplicating sequence
         seq_flat = seq.permute(0, 2, 1, 3).reshape(B * C_max, W + 1, self.d_hidden)
         gru_out, _ = self.gru(seq_flat)  # (B * C_max, W+1, d_model)
 
