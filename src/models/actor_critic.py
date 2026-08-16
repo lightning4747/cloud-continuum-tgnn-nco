@@ -59,10 +59,10 @@ class ActorCritic(nn.Module):
         # Cross Attention: Q=cnf_emb, K=node_emb, V=node_emb
         attn_out, _ = self.cross_attn(query=cnf_emb, key=node_emb, value=node_emb)  # (B, M_max, d_model)
 
-        # Logit calculation per (CNF, Node) pair with fine-grained chunking (chunk_size=64) for memory efficiency
+        # Logit calculation per (CNF, Node) pair with fine-grained chunking (chunk_size=32) for memory efficiency
         # Uses attn_out (cross-attended CNF embeddings) rather than raw cnf_emb
-        if B > 64:
-            chunk_size = 64
+        if B > 32:
+            chunk_size = 32
             logits_list = []
             for i in range(0, B, chunk_size):
                 end = min(i + chunk_size, B)
