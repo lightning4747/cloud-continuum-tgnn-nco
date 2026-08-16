@@ -60,6 +60,9 @@ class VectorContinuumEnv:
         dones_np = np.array(terminateds, dtype=bool) | np.array(truncateds, dtype=bool)
         scaled_rewards = self.reward_scaler.transform(raw_rewards_np, dones_np)
 
+        for i, info in enumerate(info_list):
+            info["raw_reward"] = raw_rewards_np[i]
+
         batched_obs = self._stack_obs(obs_list)
         return (
             batched_obs,

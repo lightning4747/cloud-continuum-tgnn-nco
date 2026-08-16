@@ -266,6 +266,7 @@ def main():
             actions_list = []
             log_probs_list = []
             rewards_list = []
+            raw_rewards_list = []
             values_list = []
             dones_list = []
             feasibility_list = []
@@ -298,6 +299,8 @@ def main():
 
                 for info in info_list:
                     feasibility_list.append(info["feasible"])
+                    if "raw_reward" in info:
+                        raw_rewards_list.append(info["raw_reward"])
 
                 batched_obs = next_batched_obs
 
@@ -392,7 +395,8 @@ def main():
             # 4. Progress Metrics Printing after every update iteration
             t_elapsed = time.perf_counter() - t_start
             fps = total_samples / t_elapsed
-            mean_reward = float(np.mean(rewards_mat))
+            mean_scaled_reward = float(np.mean(rewards_mat))
+            mean_raw_reward = float(np.mean(raw_rewards_list)) if raw_rewards_list else mean_scaled_reward
             feas_rate = float(np.mean(feasibility_list)) * 100.0
 
             vram_allocated_gb = 0.0
@@ -403,7 +407,8 @@ def main():
             vram_str = f" | VRAM: {vram_allocated_gb:5.2f}GB" if device.type == "cuda" else ""
             print(
                 f"Step {global_step:8d}/{total_timesteps} ({progress_pct:5.1f}%) | "
-                f"Reward: {mean_reward:10.2f} | "
+                f"RawRew: {mean_raw_reward:10.2f} | "
+                f"ScalRew: {mean_scaled_reward:7.2f} | "
                 f"FeasRate: {feas_rate:5.1f}% | "
                 f"PLoss: {policy_loss.item():7.4f} | "
                 f"VLoss: {value_loss.item():10.2f} | "
@@ -414,7 +419,8 @@ def main():
                 flush=True,
             )
 
-            logger.log_scalar("train/reward", mean_reward, global_step)
+            logger.log_scalar("train/raw_reward", mean_raw_reward, global_step)
+            logger.log_scalar("train/scaled_reward", mean_scaled_reward, global_step)
             logger.log_scalar("train/feasibility_rate", feas_rate, global_step)
             logger.log_scalar("train/policy_loss", policy_loss.item(), global_step)
             logger.log_scalar("train/value_loss", value_loss.item(), global_step)

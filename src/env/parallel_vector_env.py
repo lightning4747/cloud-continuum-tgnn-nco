@@ -60,13 +60,17 @@ class ParallelVectorContinuumEnv:
         dones_np = np.array(terminateds, dtype=bool) | np.array(truncateds, dtype=bool)
         scaled_rewards = self.reward_scaler.transform(raw_rewards_np, dones_np)
 
+        info_list_res = list(info_list)
+        for i, info in enumerate(info_list_res):
+            info["raw_reward"] = raw_rewards_np[i]
+
         batched_obs = self._stack_obs(obs_list)
         return (
             batched_obs,
             scaled_rewards,
             np.array(terminateds, dtype=bool),
             np.array(truncateds, dtype=bool),
-            list(info_list),
+            info_list_res,
         )
 
     def _stack_obs(self, obs_list: tuple | list) -> dict:

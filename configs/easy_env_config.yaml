@@ -1,0 +1,45 @@
+# --- Easy Test Environment Configuration for Feasibility Proof ---
+c_max: 50
+m_max: 150
+h_max: 30
+temporal_window: 5
+
+c_range: [20, 30]
+m_range: [5, 15]
+h_range: [2, 4]
+
+# Abundant node resources
+cpu_range: [32, 64]
+ram_range: [64, 256]
+storage_range: [500, 2000]
+
+# Abundant link resources
+bw_range: [1000, 10000]
+latency_range: [1, 10]
+
+# Low CNF demands
+cnf_cpu_range: [0.5, 1.5]
+cnf_ram_range: [0.5, 2.0]
+cnf_storage_range: [1, 10]
+cnf_rate_range: [10, 100]
+cnf_proc_delay_range: [0.1, 1.0]
+
+# Generous delay budget
+sfc_delay_budget_range: [100, 500]
+
+ou_theta: 0.15
+ou_sigma: 0.05
+ou_dt: 1.0
+
+alpha: 1.0
+beta: 10.0
+
+cost_per_cpu:
+  edge: 0.05
+  fog: 0.10
+  cloud: 0.20
+
+layer_probs: [0.4, 0.3, 0.3]
+waxman_alpha: 0.5
+waxman_beta: 0.5
+max_episode_steps: 200
