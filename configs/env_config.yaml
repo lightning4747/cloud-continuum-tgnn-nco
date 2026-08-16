@@ -6,27 +6,27 @@ temporal_window: 5    # GRU history window W
 
 # --- Active Scale (sampled uniformly each episode) ---
 c_range: [20, 50]     # Active nodes per episode
-m_range: [40, 150]    # Active CNFs per episode
-h_range: [10, 30]     # Active SFCs per episode
+m_range: [25, 60]     # Active CNFs per episode
+h_range: [5, 10]      # Active SFCs per episode
 
 # --- Node Resource Ranges (normalized to [0,1] inside env) ---
-cpu_range: [4, 32]        # cores
-ram_range: [8, 128]       # GB
-storage_range: [50, 1000] # GB
+cpu_range: [20, 60]        # cores
+ram_range: [32, 128]       # GB
+storage_range: [100, 1000] # GB
 
 # --- Link Resource Ranges ---
-bw_range: [100, 10000]    # Mbps
-latency_range: [1, 100]   # ms
+bw_range: [2500, 10000]   # Mbps
+latency_range: [1, 50]    # ms
 
 # --- CNF Demand Ranges ---
-cnf_cpu_range: [0.5, 8]       # cores
-cnf_ram_range: [0.5, 16]      # GB
-cnf_storage_range: [1, 50]    # GB
-cnf_rate_range: [10, 1000]    # Mbps inter-CNF traffic
-cnf_proc_delay_range: [0.1, 5] # ms processing delay
+cnf_cpu_range: [0.5, 3.0]      # cores
+cnf_ram_range: [0.5, 6.0]      # GB
+cnf_storage_range: [1, 20]     # GB
+cnf_rate_range: [10, 200]      # Mbps inter-CNF traffic
+cnf_proc_delay_range: [0.1, 2.0] # ms processing delay
 
 # --- SFC Latency Budget ---
-sfc_delay_budget_range: [20, 200]  # ms end-to-end T_h
+sfc_delay_budget_range: [120, 350]  # ms end-to-end T_h
 
 # --- Dynamic Noise (Ornstein-Uhlenbeck process) ---
 ou_theta: 0.15        # Mean-reversion speed
@@ -34,7 +34,7 @@ ou_sigma: 0.05        # Volatility
 ou_dt: 1.0            # Time delta per step
 
 # --- Reward Weights ---
-alpha: 1.0            # Latency penalty coefficient
+alpha: 0.1            # Latency penalty coefficient
 beta: 10.0            # Infeasibility penalty coefficient
 
 # --- Cost Model (per layer) ---

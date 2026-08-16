@@ -29,6 +29,5 @@ pytest-cov
 black
 flake8
 pre-commit
-
 # --- Kubernetes dry-run client ---
 kubernetes
