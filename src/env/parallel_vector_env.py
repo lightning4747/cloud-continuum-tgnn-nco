@@ -37,6 +37,11 @@ class ParallelVectorContinuumEnv:
         batched_obs = self._stack_obs(obs_list)
         return batched_obs, list(info_list)
 
+    def set_beta(self, beta: float):
+        """Broadcast updated infeasibility penalty to all worker environments."""
+        for env in self.envs:
+            env.set_beta(beta)
+
     def step(self, actions: np.ndarray) -> tuple[dict, np.ndarray, np.ndarray, np.ndarray, list[dict]]:
         """
         actions: (num_envs, M_max) numpy array

@@ -88,6 +88,10 @@ class ContinuumEnv(gym.Env):
         }
         return obs, info
 
+    def set_beta(self, beta: float):
+        """Dynamically update infeasibility penalty coefficient for curriculum annealing."""
+        self.cfg["beta"] = beta
+
     def step(self, action: np.ndarray) -> tuple[dict, float, bool, bool, dict]:
         self.current_step += 1
         placement_matrix = self._decode_action(action)
@@ -155,7 +159,12 @@ class ContinuumEnv(gym.Env):
                 ):
                     mask[m, i] = 1
             if mask[m].sum() == 0:
-                mask[m, 0] = 1  # Fallback to avoid all-zero mask
+                # Unmask all active nodes for exploration when no valid placement exists
+                for i in range(self.c_max):
+                    if i < len(self.current_state.node_active) and self.current_state.node_active[i]:
+                        mask[m, i] = 1
+                if mask[m].sum() == 0:  # Final guard if no active nodes at all
+                    mask[m, 0] = 1
         return mask
 
     def _check_capacity_constraints(self, placement: np.ndarray) -> tuple[bool, dict]:

@@ -96,6 +96,42 @@ def compute_gae_vectorized(rewards_matrix, values_matrix, next_values, dones_mat
     return torch.tensor(advantages, dtype=torch.float32), torch.tensor(returns, dtype=torch.float32)
 
 
+def get_annealed_beta(global_step: int, beta_final: float = 10.0) -> float:
+    """
+    Curriculum annealing schedule for infeasibility penalty coefficient (beta).
+    Steps 0–50k:    beta = 1.0  (soft penalty, allows exploration)
+    Steps 50k–150k: beta linearly anneals from 1.0 → beta_final
+    Steps 150k+:    beta = beta_final (full penalty)
+    """
+    beta_start = 1.0
+    ramp_start = 50_000
+    ramp_end = 150_000
+    if global_step < ramp_start:
+        return beta_start
+    elif global_step < ramp_end:
+        frac = (global_step - ramp_start) / (ramp_end - ramp_start)
+        return beta_start + frac * (beta_final - beta_start)
+    return beta_final
+
+
+def get_annealed_entropy_coef(global_step: int, entropy_coef_final: float = 0.01) -> float:
+    """
+    Entropy coefficient annealing schedule.
+    Steps 0–50k:    entropy_coef = 0.05 (high exploration pressure)
+    Steps 50k–100k: linearly decays from 0.05 → entropy_coef_final
+    Steps 100k+:    entropy_coef = entropy_coef_final
+    """
+    entropy_start = 0.05
+    ramp_start = 50_000
+    ramp_end = 100_000
+    if global_step < ramp_start:
+        return entropy_start
+    elif global_step < ramp_end:
+        frac = (global_step - ramp_start) / (ramp_end - ramp_start)
+        return entropy_start - frac * (entropy_start - entropy_coef_final)
+    return entropy_coef_final
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train High-Throughput TGNN-NCO PPO Placement Policy")
     parser.add_argument("--config", type=str, default="configs/model_config.yaml", help="Path to model config")
@@ -112,6 +148,7 @@ def main():
     parser.add_argument("--no-parallel", action="store_true", help="Disable multiprocess env vectorization")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint (.pt) to resume training from")
     parser.add_argument("--dry-run", action="store_true", help="Dry run test mode")
+    parser.add_argument("--no-beta-anneal", action="store_true", help="Disable beta curriculum annealing (use fixed beta from env_config)")
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -210,6 +247,15 @@ def main():
     try:
         while global_step < total_timesteps:
             t_start = time.perf_counter()
+
+            # --- Curriculum Annealing ---
+            current_beta = float(env_cfg["beta"])
+            if not args.no_beta_anneal:
+                current_beta = get_annealed_beta(global_step, beta_final=float(env_cfg["beta"]))
+                vec_env.set_beta(current_beta)
+            current_entropy_coef = get_annealed_entropy_coef(
+                global_step, entropy_coef_final=float(model_cfg["ppo"]["entropy_coef"])
+            )
 
             # Rollout Tensors Storage
             obs_node_feats_list = []
@@ -334,7 +380,7 @@ def main():
 
                         loss = (policy_loss
                                 + float(model_cfg["ppo"]["value_loss_coef"]) * value_loss
-                                + float(model_cfg["ppo"]["entropy_coef"]) * entropy_loss)
+                                + current_entropy_coef * entropy_loss)
 
                     optimizer.zero_grad()
                     scaler.scale(loss).backward()
@@ -362,6 +408,8 @@ def main():
                 f"PLoss: {policy_loss.item():7.4f} | "
                 f"VLoss: {value_loss.item():10.2f} | "
                 f"Entropy: {entropy_loss.item():6.3f} | "
+                f"β: {current_beta:.1f} | "
+                f"EntC: {current_entropy_coef:.4f} | "
                 f"FPS: {fps:6.1f}" + vram_str,
                 flush=True,
             )
@@ -371,6 +419,8 @@ def main():
             logger.log_scalar("train/policy_loss", policy_loss.item(), global_step)
             logger.log_scalar("train/value_loss", value_loss.item(), global_step)
             logger.log_scalar("train/fps", fps, global_step)
+            logger.log_scalar("train/beta", current_beta, global_step)
+            logger.log_scalar("train/entropy_coef", current_entropy_coef, global_step)
 
             # Periodic Checkpoint Saving via Interval Threshold
             if global_step - last_saved_step >= save_interval:

@@ -37,15 +37,22 @@ class VecRewardScaler:
     """
     Vectorized environment reward scaling wrapper.
     Tracks discounted returns G_t = gamma * G_{t-1} + r_t to compute running return variance,
-    while scaling step rewards r_t into [-10.0, 10.0].
+    while scaling step rewards r_t into [-clip_reward, clip_reward].
     Preserves all metadata in info_list (including FeasRate and feasible).
+
+    warmup_steps: Number of environment steps before normalization is applied.
+    During warmup, raw rewards are clipped to [-clip_reward, clip_reward] but not normalized.
+    This allows sufficient return variance to accumulate before Welford scaling kicks in.
     """
 
-    def __init__(self, num_envs: int, gamma: float = 0.99, clip_reward: float = 10.0, epsilon: float = 1e-8):
+    def __init__(self, num_envs: int, gamma: float = 0.99, clip_reward: float = 10.0,
+                 epsilon: float = 1e-8, warmup_steps: int = 8192):
         self.num_envs = num_envs
         self.gamma = gamma
         self.clip_reward = clip_reward
         self.epsilon = epsilon
+        self.warmup_steps = warmup_steps
+        self.total_steps = 0
 
         self.returns = np.zeros(num_envs, dtype=np.float32)
         self.running_ms = RunningMeanStd(shape=())
@@ -59,20 +66,26 @@ class VecRewardScaler:
         rewards: (num_envs,) np.ndarray
         dones: (num_envs,) np.ndarray bool
         """
+        self.total_steps += self.num_envs
+
         # Update discounted return tracking: G_t = gamma * G_{t-1} * (1 - done) + r_t
         self.returns = self.returns * self.gamma * (1.0 - dones.astype(np.float32)) + rewards
 
-        # Update running variance using Welford's algorithm
+        # Always update running variance so it is ready when warmup ends
         self.running_ms.update(self.returns)
 
-        # Scale step rewards by standard deviation of returns
+        # Reset return tracking for completed episode environments
+        self.returns[dones] = 0.0
+
+        # During warmup: return raw rewards clipped to safe range (no normalization)
+        if self.total_steps < self.warmup_steps:
+            return np.clip(rewards, -self.clip_reward, self.clip_reward).astype(np.float32)
+
+        # Post-warmup: normalize by running std of returns
         std = np.sqrt(self.running_ms.var + self.epsilon)
         scaled_rewards = rewards / std
 
         # Clip scaled step rewards to safe bounds [-clip_reward, clip_reward]
         scaled_rewards = np.clip(scaled_rewards, -self.clip_reward, self.clip_reward)
-
-        # Reset return tracking for completed episode environments
-        self.returns[dones] = 0.0
 
         return scaled_rewards.astype(np.float32)

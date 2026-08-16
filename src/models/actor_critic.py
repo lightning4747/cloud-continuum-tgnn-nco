@@ -60,18 +60,19 @@ class ActorCritic(nn.Module):
         attn_out, _ = self.cross_attn(query=cnf_emb, key=node_emb, value=node_emb)  # (B, M_max, d_model)
 
         # Logit calculation per (CNF, Node) pair with fine-grained chunking (chunk_size=64) for memory efficiency
+        # Uses attn_out (cross-attended CNF embeddings) rather than raw cnf_emb
         if B > 64:
             chunk_size = 64
             logits_list = []
             for i in range(0, B, chunk_size):
                 end = min(i + chunk_size, B)
-                comb_chunk = cnf_emb[i:end].unsqueeze(2) + node_emb[i:end].unsqueeze(1)
+                comb_chunk = attn_out[i:end].unsqueeze(2) + node_emb[i:end].unsqueeze(1)
                 log_chunk = self.logit_proj(comb_chunk).squeeze(-1)
                 logits_list.append(log_chunk)
             logits = torch.cat(logits_list, dim=0)
         else:
-            combined = cnf_emb.unsqueeze(2) + node_emb.unsqueeze(1)  # Broadcast add: (B, M_max, C_max, d_model)
-            logits = self.logit_proj(combined).squeeze(-1)            # (B, M_max, C_max)
+            combined = attn_out.unsqueeze(2) + node_emb.unsqueeze(1)  # Broadcast add: (B, M_max, C_max, d_model)
+            logits = self.logit_proj(combined).squeeze(-1)             # (B, M_max, C_max)
 
         if action_mask is not None:
             if action_mask.shape[1] > M_max:
