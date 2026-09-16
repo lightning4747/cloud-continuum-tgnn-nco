@@ -104,6 +104,16 @@ class AutoregressiveDecoder(nn.Module):
             value=node_emb,   # (B, C_max, d_model)
         )  # → (B, M_max, d_model)
 
+        # Precompute linear projection of node embeddings and attention contexts outside the loop.
+        # Linearity property: W(attn_m + node_emb) + b = (W*node_emb + b) + W*attn_m.
+        # Precomputing this avoids running Linear(d_model, d_model) 150 times per forward pass.
+        lin1 = self.logit_proj[0]
+        relu = self.logit_proj[1]
+        lin2 = self.logit_proj[2]
+
+        proj_node = lin1(node_emb)  # (B, C_max, d_model) — includes bias
+        proj_attn = torch.nn.functional.linear(attn_out, lin1.weight)  # (B, M_max, d_model) — without bias
+
         # === Sequential Decoding Loop ===
         # At decode step `step`, process CNF at cnf_order[:, step] for each batch item.
         # Each batch item independently tracks which CNF is next in its SFC-priority order.
@@ -112,7 +122,7 @@ class AutoregressiveDecoder(nn.Module):
             m_idx = cnf_order[:, step]    # (B,)  int64
 
             # --- Batch-wise gather: pull embeddings/demands for this CNF per batch item ---
-            attn_m     = attn_out[b_idx, m_idx]        # (B, d_model) — CNF m's context
+            proj_m     = proj_attn[b_idx, m_idx]       # (B, d_model) — pre-projected CNF context
             cnf_cpu_m  = cnf_cpu[b_idx,  m_idx]       # (B,) normalized CPU demand
             cnf_ram_m  = cnf_ram[b_idx,  m_idx]       # (B,) normalized RAM demand
             cnf_stor_m = cnf_stor[b_idx, m_idx]       # (B,) normalized Storage demand
@@ -120,9 +130,8 @@ class AutoregressiveDecoder(nn.Module):
             smask_m    = static_mask[b_idx, m_idx]    # (B, C_max) — env static mask
 
             # --- Compute logits: CNF m context + node embeddings → score per node ---
-            # Broadcast: attn_m (B, 1, d_model) + node_emb (B, C_max, d_model)
-            comb     = attn_m.unsqueeze(1) + node_emb       # (B, C_max, d_model)
-            logits_m = self.logit_proj(comb).squeeze(-1)    # (B, C_max)
+            h        = relu(proj_m.unsqueeze(1) + proj_node)  # (B, C_max, d_model)
+            logits_m = lin2(h).squeeze(-1)                     # (B, C_max)
 
             # --- Dynamic residual-capacity mask ---
             # Node i is feasible for CNF m only if residual[i] >= demand[m]

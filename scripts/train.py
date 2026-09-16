@@ -321,6 +321,9 @@ def main():
             feasibility_list = []
 
             # 1. Parallel Rollout Collection Loop
+            t_rollout_start = time.perf_counter()
+            log_interval = max(1, n_steps // 4)
+
             for step in range(n_steps):
                 global_step += num_envs
                 node_f, edge_i, node_h, cnf_f, mask, cnf_order, cnf_active = obs_batch_to_tensors(
@@ -365,6 +368,14 @@ def main():
 
                 batched_obs = next_batched_obs
 
+                if (step + 1) % log_interval == 0 or step == n_steps - 1:
+                    cur_fps = (step + 1) * num_envs / max(1e-4, time.perf_counter() - t_rollout_start)
+                    print(
+                        f"  [Rollout {global_step:,}/{total_timesteps:,}] Step {step+1:4d}/{n_steps:4d} "
+                        f"({(step+1)/n_steps*100:3.0f}%) | Rollout FPS: {cur_fps:5.1f}",
+                        flush=True,
+                    )
+
             # 2. Vectorized GAE Advantage Computation
             with torch.no_grad():
                 node_f_next, edge_i_next, node_h_next, cnf_f_next, _, _, _ = obs_batch_to_tensors(
@@ -406,6 +417,9 @@ def main():
             edge_i_shared = torch.tensor(edge_index_np, dtype=torch.long, device=device)
 
             # 3. PPO GPU Batched Mini-Batch Optimization with AMP
+            n_mbs = int(np.ceil(total_samples / batch_size))
+            print(f"  [PPO Update] Optimizing {total_samples:,} transitions ({n_mbs} mini-batches x {n_epochs} epochs)...", flush=True)
+
             for epoch in range(n_epochs):
                 indices = np.arange(total_samples)
                 np.random.shuffle(indices)
