@@ -7,6 +7,7 @@ import yaml
 
 from src.env.exogenous_trace import ExogenousTrace
 from src.env.generator import NetworkState, SFCBatch, TopologyGenerator
+from src.env.migration_cost import compute_migration_cost
 from src.env.state_buffer import TemporalStateBuffer
 
 
@@ -14,6 +15,15 @@ class ContinuumEnv(gym.Env):
     """
     Gymnasium-compliant environment for dynamic CNF placement on the Cloud-Continuum.
     Features stateful resource commitment, TTL-based SFC retirement, and deterministic ExogenousTrace support.
+
+    Observation keys:
+        node_features  (C_max, 9):     current node state
+        edge_attr      (C_max², 3):    flattened edge attributes
+        node_history   (W, C_max, 9):  temporal sliding window
+        cnf_features   (M_max, 5):     current CNF demands
+        action_mask    (M_max, C_max): static capacity feasibility mask
+        cnf_order      (M_max,):       SFC-priority decode ordering (tightest budget first)
+        cnf_active     (M_max,):       which CNF slots contain active CNFs (1=active, 0=padding)
     """
 
     metadata = {"render_modes": []}
@@ -43,6 +53,8 @@ class ContinuumEnv(gym.Env):
                 "node_history": spaces.Box(0.0, 1.0, shape=(self.w, self.c_max, 9), dtype=np.float32),
                 "cnf_features": spaces.Box(0.0, 1.0, shape=(self.m_max, 5), dtype=np.float32),
                 "action_mask": spaces.MultiBinary((self.m_max, self.c_max)),
+                "cnf_order":   spaces.Box(0, self.m_max - 1, shape=(self.m_max,), dtype=np.int32),
+                "cnf_active":  spaces.Box(0, 1, shape=(self.m_max,), dtype=np.int32),
             }
         )
 
@@ -62,6 +74,10 @@ class ContinuumEnv(gym.Env):
 
         # Placed SFC resource allocation map: sfc_id -> dict of allocations
         self.placed_sfc_allocations: dict[int, dict] = {}
+
+        # Migration cost tracker: which node each CNF slot was placed on last step
+        # -1 means the CNF slot is new (no previous placement → zero migration cost)
+        self.cnf_prev_node = np.full(self.m_max, -1, dtype=np.int32)
 
     def _update_shortest_paths(self):
         """
@@ -93,6 +109,9 @@ class ContinuumEnv(gym.Env):
         self.edge_bw_allocated.fill(0.0)
         self.placed_sfc_allocations.clear()
 
+        # Reset migration tracker: all CNF slots are "new" at episode start
+        self.cnf_prev_node.fill(-1)
+
         self.current_state, self.current_sfcs = self.generator.reset(seed=seed, exogenous_trace=exogenous_trace)
         self.state_buffer.reset(self.current_state)
         self._update_shortest_paths()
@@ -121,11 +140,34 @@ class ContinuumEnv(gym.Env):
         # 2. Compute costs and penalties
         cost = self._compute_deployment_cost(placement_matrix)
         latency_penalty, e2e_latencies = self._compute_latency_penalty(placement_matrix)
-        reward = self._compute_reward(cost, latency_penalty, feasible)
+
+        # 2b. Migration cost: penalty for CNFs that move to a different node vs. last step
+        if cap_feasible:
+            migration_penalty = compute_migration_cost(
+                placement_matrix=placement_matrix,
+                cnf_prev_node=self.cnf_prev_node,
+                cnf_active=self.current_sfcs.cnf_active,
+                cnf_ram=self.current_sfcs.cnf_ram,
+                edge_bw=self.current_state.edge_bw,
+                bw_range_max=self.cfg.get("bw_range", [2500, 10000])[1],
+                alpha_mig=self.cfg.get("alpha_mig", 0.5),
+                dirty_ratio=self.cfg.get("dirty_ratio", 0.20),
+            )
+        else:
+            migration_penalty = 0.0
+
+        reward = self._compute_reward(cost, latency_penalty + migration_penalty, feasible)
 
         # 3. Commit Resource Allocations if capacity feasible
         if cap_feasible:
             self._commit_resource_allocations(placement_matrix)
+            # Update migration tracker: record where each active CNF was placed this step
+            for m in range(self.m_max):
+                if self.current_sfcs.cnf_active[m]:
+                    self.cnf_prev_node[m] = int(np.argmax(placement_matrix[m]))
+                else:
+                    self.cnf_prev_node[m] = -1  # inactive slot → no previous placement
+
 
         # 4. Push current state t to state buffer BEFORE advancing state to t+1
         self.state_buffer.push(self.current_state)
@@ -171,6 +213,7 @@ class ContinuumEnv(gym.Env):
             "bw_feasible": bw_feasible,
             "deployment_cost": cost,
             "latency_penalty": latency_penalty,
+            "migration_penalty": float(migration_penalty),
             "mean_e2e_latency": float(np.mean(list(e2e_latencies.values()))) if e2e_latencies else 0.0,
             "cap_details": cap_details,
             "bw_details": bw_details,
@@ -397,6 +440,79 @@ class ContinuumEnv(gym.Env):
             r -= self.cfg["beta"]
         return r
 
+    def _compute_cnf_order(self) -> np.ndarray:
+        """
+        Produces CNF processing order for autoregressive decoding.
+
+        Algorithm:
+          1. Find active SFCs (sfc_active mask over H_max slots).
+          2. Sort active SFCs by ASCENDING sfc_delay_budget — tightest latency
+             constraint first, so those SFCs claim low-latency edge nodes before
+             looser chains consume shared capacity.
+          3. For each SFC in sorted order, append its CNFs in ascending
+             sfc_position order (chain hop 0 → 1 → 2 → ...).
+          4. Append all inactive CNF slots at the end; they are no-ops in the
+             autoregressive decoder (cnf_active[m] == 0).
+
+        Returns:
+            ordering (M_max,) int32 — a valid permutation of [0..M_max-1]
+        """
+        sfcs = self.current_sfcs
+
+        # Step 1: active SFC slot indices (positions in the H_max arrays)
+        active_sfc_slots = np.where(sfcs.sfc_active[:self.h_max])[0]
+
+        # Step 2: sort by ascending delay_budget (stable sort preserves arrival order for ties)
+        if len(active_sfc_slots) > 0:
+            budgets = sfcs.sfc_delay_budget[active_sfc_slots]
+            sorted_slots = active_sfc_slots[np.argsort(budgets, kind="stable")]
+        else:
+            sorted_slots = active_sfc_slots
+
+        # Build slot_index → actual sfc_id mapping from CNF packing order
+        # _pack_active_sfcs fills slots 0,1,2... in dict iteration order
+        # We recover which sfc_id lives in each slot by scanning cnf sfc_ids
+        seen_sfc_ids: list[int] = []
+        for m in range(self.m_max):
+            if sfcs.cnf_active[m]:
+                sid = int(sfcs.sfc_id[m])
+                if sid not in seen_sfc_ids:
+                    seen_sfc_ids.append(sid)  # preserves packing order
+
+        # slot_idx → sfc_id (slot 0 = first packed SFC, slot 1 = second, ...)
+        slot_to_sfc_id: dict[int, int] = {i: sid for i, sid in enumerate(seen_sfc_ids)}
+
+        ordered: list[int] = []
+        processed_sfc_ids: set[int] = set()
+
+        for slot_idx in sorted_slots:
+            target_sid = slot_to_sfc_id.get(int(slot_idx))
+            if target_sid is None or target_sid in processed_sfc_ids:
+                continue
+            processed_sfc_ids.add(target_sid)
+
+            # Collect CNF indices belonging to this SFC, sort by chain position
+            cnf_mask = (sfcs.sfc_id[:self.m_max] == target_sid) & sfcs.cnf_active[:self.m_max]
+            cnf_idxs = np.where(cnf_mask)[0]
+            if len(cnf_idxs) == 0:
+                continue
+            positions = sfcs.sfc_position[cnf_idxs]
+            chain_order = cnf_idxs[np.argsort(positions, kind="stable")]
+            ordered.extend(chain_order.tolist())
+
+        # Append inactive CNF slots (padding slots) at the end
+        inactive_idxs = np.where(~sfcs.cnf_active[:self.m_max])[0]
+        ordered.extend(inactive_idxs.tolist())
+
+        # Safety: ensure exactly M_max entries (cover any edge cases)
+        ordered_set = set(ordered)
+        missing = [i for i in range(self.m_max) if i not in ordered_set]
+        ordered.extend(missing)
+        if len(ordered) > self.m_max:
+            ordered = ordered[:self.m_max]
+
+        return np.array(ordered, dtype=np.int32)
+
     def _build_obs(self) -> dict:
         c_cnt = self.current_state.node_features.shape[0]
         edge_attr_mat = np.zeros((c_cnt * c_cnt, 3), dtype=np.float32)
@@ -415,4 +531,7 @@ class ContinuumEnv(gym.Env):
             "node_history": self.state_buffer.get_history(),
             "cnf_features": self.current_sfcs.cnf_features,
             "action_mask": self.build_action_mask(),
+            "cnf_order":  self._compute_cnf_order(),
+            "cnf_active": self.current_sfcs.cnf_active[:self.m_max].astype(np.int32),
         }
+

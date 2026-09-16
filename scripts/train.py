@@ -15,20 +15,34 @@ from src.baselines.flat_rl import FlatRLActorCritic
 from src.baselines.static_gnn import StaticGNNActorCritic
 from src.env.parallel_vector_env import ParallelVectorContinuumEnv
 from src.env.vector_env import VectorContinuumEnv
-from src.models.actor_critic import ActorCritic
+from src.models.actor_critic import ActorCritic, AutoregressiveActorCritic
 from src.utils.logger import TrainingLogger
 from src.utils.seed import set_seed
 
 
-def obs_batch_to_tensors(batched_obs: dict, edge_index_np: np.ndarray, device: torch.device, disable_mask: bool = False, C_max: int = 50, M_max: int = 150):
+def obs_batch_to_tensors(
+    batched_obs: dict,
+    edge_index_np: np.ndarray,
+    device: torch.device,
+    disable_mask: bool = False,
+    C_max: int = 50,
+    M_max: int = 150,
+):
     """
     Converts batched observation dict arrays into PyTorch Tensors on target device,
     ensuring fixed (B, C_max, F) and (B, M_max, F) dimensions.
+
+    Returns:
+        node_feats, edge_idx, node_hist, cnf_feats, action_mask,
+        cnf_order (B, M_max) int64,
+        cnf_active (B, M_max) bool
     """
     nf = batched_obs["node_features"]
     nh = batched_obs["node_history"]
     cf = batched_obs["cnf_features"]
     am = batched_obs["action_mask"]
+    co = batched_obs.get("cnf_order", None)    # (B, M_max) int32, may be absent for legacy
+    ca = batched_obs.get("cnf_active", None)   # (B, M_max) int32
 
     B = nf.shape[0]
 
@@ -61,17 +75,39 @@ def obs_batch_to_tensors(batched_obs: dict, edge_index_np: np.ndarray, device: t
         pad_c = C_max - am.shape[2]
         am = np.pad(am, ((0, 0), (0, 0), (0, pad_c)), mode="constant")
 
+    # CNF Order (B, M_max) int64 — SFC-priority decode ordering
+    if co is not None:
+        if co.shape[1] > M_max:
+            co = co[:, :M_max]
+        elif co.shape[1] < M_max:
+            # Pad tail with sequential fallback indices (inactive slots)
+            tail = np.tile(np.arange(co.shape[1], M_max, dtype=np.int32), (B, 1))
+            co = np.concatenate([co, tail], axis=1)
+        cnf_order = torch.from_numpy(co).long().to(device)
+    else:
+        cnf_order = torch.arange(M_max, device=device).unsqueeze(0).expand(B, -1)
+
+    # CNF Active (B, M_max) bool
+    if ca is not None:
+        if ca.shape[1] > M_max:
+            ca = ca[:, :M_max]
+        elif ca.shape[1] < M_max:
+            ca = np.pad(ca, ((0, 0), (0, M_max - ca.shape[1])), mode="constant")
+        cnf_active = torch.from_numpy(ca).bool().to(device)
+    else:
+        cnf_active = torch.ones(B, M_max, dtype=torch.bool, device=device)
+
     node_feats = torch.from_numpy(nf).float().to(device)
-    edge_idx = torch.from_numpy(edge_index_np).long().to(device)
-    node_hist = torch.from_numpy(nh).float().to(device)
-    cnf_feats = torch.from_numpy(cf).float().to(device)
+    edge_idx   = torch.from_numpy(edge_index_np).long().to(device)
+    node_hist  = torch.from_numpy(nh).float().to(device)
+    cnf_feats  = torch.from_numpy(cf).float().to(device)
 
     if disable_mask:
         action_mask = torch.ones_like(torch.from_numpy(am)).bool().to(device)
     else:
         action_mask = torch.from_numpy(am).bool().to(device)
 
-    return node_feats, edge_idx, node_hist, cnf_feats, action_mask
+    return node_feats, edge_idx, node_hist, cnf_feats, action_mask, cnf_order, cnf_active
 
 
 def compute_gae_vectorized(rewards_matrix, values_matrix, next_values, dones_matrix, gamma=0.99, gae_lambda=0.95):
@@ -136,7 +172,12 @@ def main():
     parser = argparse.ArgumentParser(description="Train High-Throughput TGNN-NCO PPO Placement Policy")
     parser.add_argument("--config", type=str, default="configs/model_config.yaml", help="Path to model config")
     parser.add_argument("--env-config", type=str, default="configs/env_config.yaml", help="Path to env config")
-    parser.add_argument("--model", type=str, default="tgnn", choices=["tgnn", "static_gnn", "flat_rl"], help="Model architecture variant")
+    parser.add_argument(
+        "--model", type=str, default="tgnn",
+        choices=["tgnn", "static_gnn", "flat_rl", "auto_tgnn", "auto_static"],
+        help="Model architecture variant (auto_* = autoregressive decoder with feasibility guarantee)",
+    )
+
     parser.add_argument("--disable-mask", action="store_true", help="Disable action masking for ablation study")
     parser.add_argument("--num-envs", type=int, default=32, help="Number of parallel vectorized environments")
     parser.add_argument("--batch-size", type=int, default=512, help="PPO mini-batch size for GPU optimization")
@@ -217,6 +258,12 @@ def main():
         model = StaticGNNActorCritic(model_cfg).to(device)
     elif args.model == "flat_rl":
         model = FlatRLActorCritic(model_cfg).to(device)
+    elif args.model == "auto_tgnn":
+        model = AutoregressiveActorCritic(model_cfg).to(device)
+    elif args.model == "auto_static":
+        from src.baselines.static_gnn import StaticGNNEncoder
+        model = AutoregressiveActorCritic(model_cfg).to(device)
+        model.encoder = StaticGNNEncoder(model_cfg).to(device)
     else:
         model = ActorCritic(model_cfg).to(device)
 
@@ -262,6 +309,8 @@ def main():
             obs_node_hist_list = []
             obs_cnf_feats_list = []
             obs_action_mask_list = []
+            obs_cnf_order_list = []    # NEW: SFC-priority ordering for each step
+            obs_cnf_active_list = []   # NEW: active CNF mask for each step
 
             actions_list = []
             log_probs_list = []
@@ -274,13 +323,23 @@ def main():
             # 1. Parallel Rollout Collection Loop
             for step in range(n_steps):
                 global_step += num_envs
-                node_f, edge_i, node_h, cnf_f, mask = obs_batch_to_tensors(batched_obs, edge_index_np, device, disable_mask=args.disable_mask)
+                node_f, edge_i, node_h, cnf_f, mask, cnf_order, cnf_active = obs_batch_to_tensors(
+                    batched_obs, edge_index_np, device, disable_mask=args.disable_mask
+                )
 
                 with torch.no_grad():
                     with torch.amp.autocast("cuda", enabled=use_amp):
-                        actions, log_prob, entropy, value = model.get_action_and_value(
-                            node_f, edge_i, node_h, cnf_f, action_mask=mask
-                        )
+                        if isinstance(model, AutoregressiveActorCritic):
+                            actions, log_prob, entropy, value = model.get_action_and_value(
+                                node_f, edge_i, node_h, cnf_f,
+                                action_mask=mask,
+                                cnf_order=cnf_order,
+                                cnf_active=cnf_active,
+                            )
+                        else:
+                            actions, log_prob, entropy, value = model.get_action_and_value(
+                                node_f, edge_i, node_h, cnf_f, action_mask=mask
+                            )
 
                 actions_np = actions.cpu().numpy()  # (num_envs, M_max)
                 next_batched_obs, rewards, terminateds, truncateds, info_list = vec_env.step(actions_np)
@@ -290,6 +349,8 @@ def main():
                 obs_node_hist_list.append(node_h)
                 obs_cnf_feats_list.append(cnf_f)
                 obs_action_mask_list.append(mask)
+                obs_cnf_order_list.append(cnf_order)
+                obs_cnf_active_list.append(cnf_active)
 
                 actions_list.append(actions)
                 log_probs_list.append(log_prob)
@@ -306,7 +367,10 @@ def main():
 
             # 2. Vectorized GAE Advantage Computation
             with torch.no_grad():
-                node_f_next, edge_i_next, node_h_next, cnf_f_next, _ = obs_batch_to_tensors(batched_obs, edge_index_np, device, disable_mask=args.disable_mask)
+                node_f_next, edge_i_next, node_h_next, cnf_f_next, _, _, _ = obs_batch_to_tensors(
+                    batched_obs, edge_index_np, device, disable_mask=args.disable_mask
+                )
+
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     next_vals = model.get_value(node_f_next, edge_i_next, node_h_next, cnf_f_next).squeeze(-1).cpu().numpy()
 
@@ -321,21 +385,23 @@ def main():
 
             # Flatten rollout dimensions (N_steps * num_envs, ...)
             total_samples = n_steps * num_envs
-            flat_node_feats = torch.cat(obs_node_feats_list, dim=0)
-            flat_node_hist = torch.cat(obs_node_hist_list, dim=0)
-            flat_cnf_feats = torch.cat(obs_cnf_feats_list, dim=0)
-            flat_action_masks = torch.cat(obs_action_mask_list, dim=0)
-            flat_actions = torch.cat(actions_list, dim=0)
+            flat_node_feats    = torch.cat(obs_node_feats_list, dim=0)
+            flat_node_hist     = torch.cat(obs_node_hist_list, dim=0)
+            flat_cnf_feats     = torch.cat(obs_cnf_feats_list, dim=0)
+            flat_action_masks  = torch.cat(obs_action_mask_list, dim=0)
+            flat_cnf_order     = torch.cat(obs_cnf_order_list, dim=0)    # (total, M_max)
+            flat_cnf_active    = torch.cat(obs_cnf_active_list, dim=0)   # (total, M_max)
+            flat_actions       = torch.cat(actions_list, dim=0)
             flat_old_log_probs = torch.cat(log_probs_list, dim=0)
 
             flat_advantages = advantages_tensor.reshape(-1)
-            flat_returns = returns_tensor.reshape(-1)
+            flat_returns    = returns_tensor.reshape(-1)
             flat_old_values = torch.tensor(values_mat, dtype=torch.float32).reshape(-1).to(device)
 
             # Advantage Normalization
             flat_advantages = (flat_advantages - flat_advantages.mean()) / (flat_advantages.std() + 1e-8)
             flat_advantages = flat_advantages.to(device)
-            flat_returns = flat_returns.to(device)
+            flat_returns    = flat_returns.to(device)
 
             edge_i_shared = torch.tensor(edge_index_np, dtype=torch.long, device=device)
 
@@ -348,20 +414,32 @@ def main():
                     end = start + batch_size
                     mb_idx = indices[start:end]
 
-                    mb_node_f = flat_node_feats[mb_idx]
-                    mb_node_h = flat_node_hist[mb_idx]
-                    mb_cnf_f = flat_cnf_feats[mb_idx]
-                    mb_mask = flat_action_masks[mb_idx]
-                    mb_act = flat_actions[mb_idx]
-                    mb_old_lp = flat_old_log_probs[mb_idx]
-                    mb_adv = flat_advantages[mb_idx]
-                    mb_ret = flat_returns[mb_idx]
+                    mb_node_f  = flat_node_feats[mb_idx]
+                    mb_node_h  = flat_node_hist[mb_idx]
+                    mb_cnf_f   = flat_cnf_feats[mb_idx]
+                    mb_mask    = flat_action_masks[mb_idx]
+                    mb_co      = flat_cnf_order[mb_idx]
+                    mb_ca      = flat_cnf_active[mb_idx]
+                    mb_act     = flat_actions[mb_idx]
+                    mb_old_lp  = flat_old_log_probs[mb_idx]
+                    mb_adv     = flat_advantages[mb_idx]
+                    mb_ret     = flat_returns[mb_idx]
                     mb_old_val = flat_old_values[mb_idx]
 
                     with torch.amp.autocast("cuda", enabled=use_amp):
-                        _, new_log_prob, new_entropy, new_value = model.get_action_and_value(
-                            mb_node_f, edge_i_shared, mb_node_h, mb_cnf_f, action_mask=mb_mask, action=mb_act
-                        )
+                        if isinstance(model, AutoregressiveActorCritic):
+                            _, new_log_prob, new_entropy, new_value = model.get_action_and_value(
+                                mb_node_f, edge_i_shared, mb_node_h, mb_cnf_f,
+                                action_mask=mb_mask,
+                                cnf_order=mb_co,
+                                cnf_active=mb_ca,
+                                action=mb_act,
+                            )
+                        else:
+                            _, new_log_prob, new_entropy, new_value = model.get_action_and_value(
+                                mb_node_f, edge_i_shared, mb_node_h, mb_cnf_f,
+                                action_mask=mb_mask, action=mb_act
+                            )
 
                         clip_eps = float(model_cfg["ppo"]["clip_epsilon"])
 

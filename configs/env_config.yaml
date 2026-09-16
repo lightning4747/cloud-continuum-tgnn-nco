@@ -42,6 +42,10 @@ node_failure_prob: 0.01       # Dynamic node failure probability per step
 alpha: 0.1            # Latency penalty coefficient
 beta: 10.0            # Infeasibility penalty coefficient
 
+# --- Migration Cost Parameters ---
+alpha_mig: 0.5         # Migration penalty scaling coefficient (alpha × T_migration_ms)
+dirty_ratio: 0.20      # Dirty memory fraction for pre-copy migration model (20% of RAM)
+
 # --- Cost Model (per layer) ---
 cost_per_cpu:
   edge: 0.05
