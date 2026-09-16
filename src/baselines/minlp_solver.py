@@ -30,7 +30,7 @@ class MINLPSolver(BaseSolver):
 
         m = GEKKO(remote=False)
         m.options.SOLVER = 1  # APOPT solver for MINLP/MILP
-        m.options.TIME_LOC = self.timeout
+        m.options.MAX_TIME = self.timeout
 
         # Decision variables x[m, i] binary
         x = m.Array(m.Var, (m_act, n_act), lb=0, ub=1, integer=True)
