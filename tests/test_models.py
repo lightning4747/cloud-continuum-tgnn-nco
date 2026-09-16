@@ -12,9 +12,9 @@ def test_tgnn_encoder_shapes():
 
     d_model = cfg["tgnn"]["d_model"]
     encoder = TGNNEncoder(cfg)
-    node_features = torch.randn(2, 50, 6)
+    node_features = torch.randn(2, 50, 9)
     edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
-    node_history = torch.randn(2, 5, 50, 6)
+    node_history = torch.randn(2, 5, 50, 9)
     cnf_features = torch.randn(2, 150, 5)
 
     node_emb, cnf_emb = encoder(node_features, edge_index, node_history, cnf_features)
@@ -27,9 +27,9 @@ def test_actor_critic_forward_and_sample():
         cfg = yaml.safe_load(f)
 
     ac = ActorCritic(cfg)
-    node_features = torch.randn(2, 50, 6)
+    node_features = torch.randn(2, 50, 9)
     edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
-    node_history = torch.randn(2, 5, 50, 6)
+    node_history = torch.randn(2, 5, 50, 9)
     cnf_features = torch.randn(2, 150, 5)
     action_mask = torch.ones((2, 150, 50), dtype=torch.bool)
 
@@ -48,9 +48,9 @@ def test_ablation_models_forward_and_interface_conformance():
         cfg = yaml.safe_load(f)
 
     B, C_max, M_max, W = 4, 50, 150, 5
-    node_f = torch.randn(B, C_max, 6)
+    node_f = torch.randn(B, C_max, 9)
     edge_i = torch.tensor([[0, 1, 2], [1, 2, 0]], dtype=torch.long)
-    node_h = torch.randn(B, W, C_max, 6)
+    node_h = torch.randn(B, W, C_max, 9)
     cnf_f = torch.randn(B, M_max, 5)
     mask = torch.ones(B, M_max, C_max, dtype=torch.bool)
 

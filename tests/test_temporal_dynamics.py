@@ -102,15 +102,15 @@ def test_node_history_distinct_chronology():
 def test_no_duplicate_state_in_tgnn_encoder():
     encoder = TGNNEncoder({
         "tgnn": {
-            "f_node": 6, "f_cnf": 5, "d_hidden": 64, "d_model": 64,
+            "f_node": 9, "f_cnf": 5, "d_hidden": 64, "d_model": 64,
             "temporal_window": 5, "n_spatial_layers": 2
         }
     })
 
     B, C_max, M_max, W = 2, 50, 150, 5
-    node_features = torch.randn(B, C_max, 6)
+    node_features = torch.randn(B, C_max, 9)
     edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
-    node_history = torch.randn(B, W, C_max, 6)
+    node_history = torch.randn(B, W, C_max, 9)
     cnf_features = torch.randn(B, M_max, 5)
 
     node_emb, cnf_emb = encoder(node_features, edge_index, node_history, cnf_features)

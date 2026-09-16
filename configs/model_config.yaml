@@ -1,7 +1,7 @@
 # --- TGNN Encoder ---
 tgnn:
   backbone: "evolvegcn_o"    # Options: evolvegcn_o | temporal_attention
-  f_node: 6                  # Node input feature dim: [cpu, ram, storage, layer_oh×3]
+  f_node: 9                  # Node input feature dim: [cpu, ram, storage, layer_oh×3, cpu_alloc, ram_alloc, stor_alloc]
   f_edge: 3                  # Edge input feature dim: [bw, latency, active]
   f_cnf: 5                   # CNF feature dim: [cpu, ram, storage, rate, proc_delay]
   d_hidden: 256              # Hidden layer dimension (Scaled for GPU VRAM saturation)

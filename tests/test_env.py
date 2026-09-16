@@ -24,9 +24,9 @@ def test_env_observation_shapes():
     env = ContinuumEnv(seed=42)
     obs, info = env.reset(seed=42)
 
-    assert obs["node_features"].shape == (50, 6)
+    assert obs["node_features"].shape == (50, 9)
     assert obs["edge_attr"].shape == (2500, 3)
-    assert obs["node_history"].shape == (5, 50, 6)
+    assert obs["node_history"].shape == (5, 50, 9)
     assert obs["cnf_features"].shape == (150, 5)
     assert obs["action_mask"].shape == (150, 50)
     assert env.observation_space.contains(obs)
@@ -50,7 +50,7 @@ def test_env_step_transition():
     assert not terminated
     assert not truncated
     assert "feasible" in next_info
-    assert next_obs["node_features"].shape == (50, 6)
+    assert next_obs["node_features"].shape == (50, 9)
 
 
 def test_1000_step_rollout_stability():

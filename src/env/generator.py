@@ -91,6 +91,8 @@ class TopologyGenerator:
 
             self.ou_state_cpu = self.exogenous_trace.ou_noise_cpu[0].copy()
             self.ou_state_bw = self.exogenous_trace.ou_noise_bw[0].copy()
+            self.ou_state_ram = self.ram_max.copy()
+            self.ou_state_stor = self.storage_max.copy()
             node_active_override = self.exogenous_trace.node_failures[0]
 
             initial_sfc_specs = self.exogenous_trace.sfc_arrivals.get(0, [])
@@ -123,6 +125,8 @@ class TopologyGenerator:
             self.storage_max = self.rng.uniform(storage_range[0], storage_range[1], size=self.n_nodes)
 
             self.ou_state_cpu = self.cpu_max.copy()
+            self.ou_state_ram = self.ram_max.copy()
+            self.ou_state_stor = self.storage_max.copy()
 
             bw_range = self.cfg.get("bw_range", [2500, 10000])
             lat_range = self.cfg.get("latency_range", [1, 50])
@@ -163,17 +167,20 @@ class TopologyGenerator:
 
         state = self._build_network_state(
             cpu_avail=self.ou_state_cpu,
-            ram_avail=self.ram_max.copy(),
-            storage_avail=self.storage_max.copy(),
+            ram_avail=self.ou_state_ram.copy(),
+            storage_avail=self.ou_state_stor.copy(),
             layers=self.node_layers,
             edge_bw_avail=self.ou_state_bw,
             edge_lat=self.lat_matrix,
             edge_act=self.edge_act_mat,
             node_active_override=node_active_override,
             cpu_total=self.ou_state_cpu.copy(),
-            ram_total=self.ram_max.copy(),
-            storage_total=self.storage_max.copy(),
+            ram_total=self.ou_state_ram.copy(),
+            storage_total=self.ou_state_stor.copy(),
             bw_total=self.ou_state_bw.copy(),
+            cpu_allocated=np.zeros(self.n_nodes, dtype=np.float32),
+            ram_allocated=np.zeros(self.n_nodes, dtype=np.float32),
+            stor_allocated=np.zeros(self.n_nodes, dtype=np.float32),
         )
 
         sfc_batch = self._pack_active_sfcs()
@@ -203,11 +210,19 @@ class TopologyGenerator:
             new_arrivals = self.exogenous_trace.sfc_arrivals.get(t_idx, [])
         else:
             theta = self.cfg.get("ou_theta", 0.15)
-            sigma = self.cfg.get("ou_sigma", 0.05)
+            sigma = self.cfg.get("ou_sigma", 2.0)
+            sigma_ram = self.cfg.get("ou_sigma_ram", 5.0)
+            sigma_stor = self.cfg.get("ou_sigma_storage", 50.0)
             dt = self.cfg.get("ou_dt", 1.0)
 
             dx_cpu = theta * (self.cpu_max - self.ou_state_cpu) * dt + sigma * self.rng.normal(size=self.n_nodes)
             self.ou_state_cpu = np.clip(self.ou_state_cpu + dx_cpu, 0.1 * self.cpu_max, self.cpu_max)
+
+            dx_ram = theta * (self.ram_max - self.ou_state_ram) * dt + sigma_ram * self.rng.normal(size=self.n_nodes)
+            self.ou_state_ram = np.clip(self.ou_state_ram + dx_ram, 0.1 * self.ram_max, self.ram_max)
+
+            dx_stor = theta * (self.storage_max - self.ou_state_stor) * dt + sigma_stor * self.rng.normal(size=self.n_nodes)
+            self.ou_state_stor = np.clip(self.ou_state_stor + dx_stor, 0.1 * self.storage_max, self.storage_max)
 
             dx_bw = theta * (self.bw_max - self.ou_state_bw) * dt + sigma * self.rng.normal(size=(self.n_nodes, self.n_nodes))
             self.ou_state_bw = np.clip(self.ou_state_bw + dx_bw, 0.1 * self.bw_max, self.bw_max)
@@ -251,10 +266,10 @@ class TopologyGenerator:
                     "path_allocations": None,
                 }
 
-        # Calculate Available Resources
+        # Calculate Available Resources (OU total - committed allocations)
         cpu_avail = np.maximum(0.0, self.ou_state_cpu - node_cpu_allocated[:self.n_nodes])
-        ram_avail = np.maximum(0.0, self.ram_max - node_ram_allocated[:self.n_nodes])
-        storage_avail = np.maximum(0.0, self.storage_max - node_storage_allocated[:self.n_nodes])
+        ram_avail = np.maximum(0.0, self.ou_state_ram - node_ram_allocated[:self.n_nodes])
+        storage_avail = np.maximum(0.0, self.ou_state_stor - node_storage_allocated[:self.n_nodes])
         bw_avail = np.maximum(0.0, self.ou_state_bw - edge_bw_allocated[:self.n_nodes, :self.n_nodes])
 
         state = self._build_network_state(
@@ -267,9 +282,12 @@ class TopologyGenerator:
             edge_act=self.edge_act_mat,
             node_active_override=node_active,
             cpu_total=self.ou_state_cpu.copy(),
-            ram_total=self.ram_max.copy(),
-            storage_total=self.storage_max.copy(),
+            ram_total=self.ou_state_ram.copy(),
+            storage_total=self.ou_state_stor.copy(),
             bw_total=self.ou_state_bw.copy(),
+            cpu_allocated=node_cpu_allocated[:self.n_nodes].copy(),
+            ram_allocated=node_ram_allocated[:self.n_nodes].copy(),
+            stor_allocated=node_storage_allocated[:self.n_nodes].copy(),
         )
 
         sfc_batch = self._pack_active_sfcs()
@@ -315,6 +333,9 @@ class TopologyGenerator:
         ram_total: np.ndarray | None = None,
         storage_total: np.ndarray | None = None,
         bw_total: np.ndarray | None = None,
+        cpu_allocated: np.ndarray | None = None,
+        ram_allocated: np.ndarray | None = None,
+        stor_allocated: np.ndarray | None = None,
     ) -> NetworkState:
         c_eff = max(self.c_max, self.n_nodes)
 
@@ -335,8 +356,13 @@ class TopologyGenerator:
         pad_storage[:self.n_nodes] = storage_avail
         pad_layer[:self.n_nodes] = layers
 
-        # Normalized features (6 dims): [cpu_avail_norm, ram_avail_norm, storage_avail_norm, layer_oh0, layer_oh1, layer_oh2]
-        node_feats = np.zeros((c_eff, 6), dtype=np.float32)
+        # Normalized features (9 dims):
+        # [cpu_avail_norm, ram_avail_norm, storage_avail_norm,
+        #  layer_oh0, layer_oh1, layer_oh2,
+        #  cpu_allocated_norm, ram_allocated_norm, stor_allocated_norm]
+        # Dims 6-8 expose committed resource load — the strongest temporal signal
+        # (SFC arrivals/retirements cause load changes 58x larger than OU noise alone)
+        node_feats = np.zeros((c_eff, 9), dtype=np.float32)
         node_feats[:self.n_nodes, 0] = cpu_avail / self.cfg["cpu_range"][1]
         node_feats[:self.n_nodes, 1] = ram_avail / self.cfg["ram_range"][1]
         node_feats[:self.n_nodes, 2] = storage_avail / self.cfg["storage_range"][1]
@@ -344,6 +370,14 @@ class TopologyGenerator:
         for i in range(self.n_nodes):
             l = layers[i]
             node_feats[i, 3 + l] = 1.0
+
+        # Allocation state features (dims 6-8): normalized committed load per node
+        if cpu_allocated is not None:
+            node_feats[:self.n_nodes, 6] = cpu_allocated / self.cfg["cpu_range"][1]
+        if ram_allocated is not None:
+            node_feats[:self.n_nodes, 7] = ram_allocated / self.cfg["ram_range"][1]
+        if stor_allocated is not None:
+            node_feats[:self.n_nodes, 8] = stor_allocated / self.cfg["storage_range"][1]
 
         # Padded Edge Tensors
         pad_bw = np.zeros((c_eff, c_eff), dtype=np.float32)

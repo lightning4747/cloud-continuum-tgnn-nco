@@ -28,8 +28,13 @@ cnf_proc_delay_range: [0.1, 1.0]
 sfc_delay_budget_range: [100, 500]
 
 ou_theta: 0.15
-ou_sigma: 0.05
+ou_sigma: 2.0
+ou_sigma_ram: 5.0
+ou_sigma_storage: 50.0
 ou_dt: 1.0
+sfc_ttl_range: [10, 40]
+sfc_arrival_prob: 0.30
+node_failure_prob: 0.01
 
 alpha: 1.0
 beta: 10.0

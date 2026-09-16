@@ -30,7 +30,9 @@ sfc_delay_budget_range: [120, 350]  # ms end-to-end T_h
 
 # --- Dynamic Noise & Lifecycle Parameters ---
 ou_theta: 0.15        # Mean-reversion speed
-ou_sigma: 0.05        # Volatility
+ou_sigma: 2.0         # CPU volatility (cores) — 40x increase for meaningful temporal signal
+ou_sigma_ram: 5.0     # RAM volatility (GB) — adds OU noise to RAM dimension
+ou_sigma_storage: 50.0 # Storage volatility (GB) — adds OU noise to storage dimension
 ou_dt: 1.0            # Time delta per step
 sfc_ttl_range: [10, 40]       # SFC lifespan in scheduling steps
 sfc_arrival_prob: 0.30        # Probability of new SFC arrival per step

@@ -75,7 +75,7 @@ class TGNNEncoder(nn.Module):
     def __init__(self, cfg: dict):
         super().__init__()
         tgnn_cfg = cfg.get("tgnn", cfg)
-        self.f_node = tgnn_cfg.get("f_node", 6)
+        self.f_node = tgnn_cfg.get("f_node", 9)
         self.f_cnf = tgnn_cfg.get("f_cnf", 5)
         self.d_hidden = tgnn_cfg.get("d_hidden", 128)
         self.d_model = tgnn_cfg.get("d_model", 128)

@@ -33,14 +33,14 @@ class ContinuumEnv(gym.Env):
         self.max_steps = self.cfg["max_episode_steps"]
 
         self.generator = TopologyGenerator(self.cfg, seed=seed)
-        self.state_buffer = TemporalStateBuffer(window_size=self.w, c_max=self.c_max, f_node=6)
+        self.state_buffer = TemporalStateBuffer(window_size=self.w, c_max=self.c_max, f_node=9)
 
         # Spaces definition
         self.observation_space = spaces.Dict(
             {
-                "node_features": spaces.Box(0.0, 1.0, shape=(self.c_max, 6), dtype=np.float32),
+                "node_features": spaces.Box(0.0, 1.0, shape=(self.c_max, 9), dtype=np.float32),
                 "edge_attr": spaces.Box(0.0, 1.0, shape=(self.c_max * self.c_max, 3), dtype=np.float32),
-                "node_history": spaces.Box(0.0, 1.0, shape=(self.w, self.c_max, 6), dtype=np.float32),
+                "node_history": spaces.Box(0.0, 1.0, shape=(self.w, self.c_max, 9), dtype=np.float32),
                 "cnf_features": spaces.Box(0.0, 1.0, shape=(self.m_max, 5), dtype=np.float32),
                 "action_mask": spaces.MultiBinary((self.m_max, self.c_max)),
             }
