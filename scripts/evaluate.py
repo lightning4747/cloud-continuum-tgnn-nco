@@ -28,7 +28,7 @@ from src.baselines.greedy import GreedyFFD, GreedyLatencyAware
 from src.baselines.static_gnn import StaticGNNActorCritic
 from src.env.continuum_env import ContinuumEnv
 from src.env.exogenous_trace import ExogenousTraceGenerator
-from src.models.actor_critic import ActorCritic
+from src.models.actor_critic import ActorCritic, AutoregressiveActorCritic
 
 
 class RandomValidSolver:
@@ -44,15 +44,21 @@ class RandomValidSolver:
 
 
 def obs_to_tensors(obs: dict, edge_index_np: np.ndarray, device: torch.device, disable_mask: bool = False):
+    """Convert a single-env observation dict to model input tensors (batch size = 1)."""
     node_f = torch.from_numpy(obs["node_features"]).unsqueeze(0).float().to(device)
     edge_i = torch.from_numpy(edge_index_np).long().to(device)
     node_h = torch.from_numpy(obs["node_history"]).unsqueeze(0).float().to(device)
-    cnf_f = torch.from_numpy(obs["cnf_features"]).unsqueeze(0).float().to(device)
+    cnf_f  = torch.from_numpy(obs["cnf_features"]).unsqueeze(0).float().to(device)
     if disable_mask:
         mask = torch.ones_like(torch.from_numpy(obs["action_mask"])).unsqueeze(0).bool().to(device)
     else:
         mask = torch.from_numpy(obs["action_mask"]).unsqueeze(0).bool().to(device)
-    return node_f, edge_i, node_h, cnf_f, mask
+    # SFC-priority ordering and active-slot indicator (required by AutoregressiveActorCritic)
+    cnf_order  = torch.from_numpy(obs["cnf_order"].astype("int64")).unsqueeze(0).to(device)
+    cnf_active = torch.from_numpy(obs["cnf_active"].astype("bool")).unsqueeze(0).to(device)
+    return node_f, edge_i, node_h, cnf_f, mask, cnf_order, cnf_active
+
+
 
 
 def main():
@@ -60,7 +66,13 @@ def main():
     parser.add_argument("--config", type=str, default="configs/evaluation_config.yaml")
     parser.add_argument("--env-config", type=str, default="configs/env_config.yaml")
     parser.add_argument("--model-config", type=str, default="configs/model_config.yaml")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/tgnn_ppo_step_200704.pt")
+    # Default to the best trained checkpoint (autoregressive TGNN-PPO)
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/auto_tgnn_ppo_final.pt",
+                        help="Path to TGNN-NCO checkpoint (.pt)")
+    parser.add_argument("--auto", action="store_true", default=True,
+                        help="Load TGNN checkpoint as AutoregressiveActorCritic (default). "
+                             "Pass --no-auto for legacy non-autoregressive ActorCritic.")
+    parser.add_argument("--no-auto", dest="auto", action="store_false")
     parser.add_argument("--static-gnn-checkpoint", type=str, default=None)
     parser.add_argument("--flat-rl-checkpoint", type=str, default=None)
     parser.add_argument("--nomask-checkpoint", type=str, default=None)
@@ -97,42 +109,55 @@ def main():
         "GreedyLatencyAware": GreedyLatencyAware(),
     }
 
+    # Merge env config into model config so AutoregressiveActorCritic.__init__
+    # can read cpu_range, ram_range, etc. for the normalization scale ratios.
+    merged_cfg = {**env_cfg, **model_cfg}
+
     # Neural Policy Solvers
     if os.path.exists(args.checkpoint):
-        print(f"--> Loading TGNN-NCO checkpoint from '{args.checkpoint}'...")
-        tgnn_model = ActorCritic(model_cfg).to(device)
-        ckpt = torch.load(args.checkpoint, map_location=device)
-        tgnn_model.load_state_dict(ckpt.get("model_state", ckpt))
+        model_cls = AutoregressiveActorCritic if args.auto else ActorCritic
+        print(f"--> Loading TGNN-NCO checkpoint from '{args.checkpoint}' as {model_cls.__name__}...")
+        tgnn_model = model_cls(merged_cfg).to(device)
+        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        state = ckpt.get("model_state", ckpt)
+        tgnn_model.load_state_dict(state, strict=False)
         tgnn_model.eval()
-        solvers["TGNN-NCO"] = tgnn_model
+        solvers["TGNN-NCO (Ours)"] = tgnn_model
+    else:
+        print(f"[WARNING] TGNN-NCO checkpoint not found at '{args.checkpoint}' — skipping.")
 
     if args.static_gnn_checkpoint and os.path.exists(args.static_gnn_checkpoint):
-        print(f"--> Loading Static-GNN checkpoint from '{args.static_gnn_checkpoint}'...")
-        sgnn_model = StaticGNNActorCritic(model_cfg).to(device)
-        ckpt = torch.load(args.static_gnn_checkpoint, map_location=device)
-        sgnn_model.load_state_dict(ckpt.get("model_state", ckpt))
+        # auto_static_ppo checkpoints are AutoregressiveActorCritic trained with a static encoder
+        ckpt = torch.load(args.static_gnn_checkpoint, map_location=device, weights_only=False)
+        variant = ckpt.get("model_variant", "")
+        if "auto_static" in variant or "auto" in variant:
+            print(f"--> Loading Static-GNN checkpoint '{args.static_gnn_checkpoint}' as AutoregressiveActorCritic (auto_static variant)...")
+            sgnn_model = AutoregressiveActorCritic(merged_cfg).to(device)
+        else:
+            print(f"--> Loading Static-GNN checkpoint '{args.static_gnn_checkpoint}' as StaticGNNActorCritic...")
+            sgnn_model = StaticGNNActorCritic(merged_cfg).to(device)
+        sgnn_model.load_state_dict(ckpt.get("model_state", ckpt), strict=False)
         sgnn_model.eval()
-        solvers["Static-GNN"] = sgnn_model
-    else:
-        solvers["Static-GNN"] = StaticGNNActorCritic(model_cfg).to(device).eval()
+        solvers["Static-GNN-PPO"] = sgnn_model
+    # (no untrained Static-GNN fallback — untrained baselines pollute comparison tables)
 
     if args.flat_rl_checkpoint and os.path.exists(args.flat_rl_checkpoint):
         print(f"--> Loading Flat-RL checkpoint from '{args.flat_rl_checkpoint}'...")
-        frl_model = FlatRLActorCritic(model_cfg).to(device)
-        ckpt = torch.load(args.flat_rl_checkpoint, map_location=device)
-        frl_model.load_state_dict(ckpt.get("model_state", ckpt))
+        frl_model = FlatRLActorCritic(merged_cfg).to(device)
+        ckpt = torch.load(args.flat_rl_checkpoint, map_location=device, weights_only=False)
+        frl_model.load_state_dict(ckpt.get("model_state", ckpt), strict=False)
         frl_model.eval()
         solvers["Flat-RL"] = frl_model
-    else:
-        solvers["Flat-RL"] = FlatRLActorCritic(model_cfg).to(device).eval()
 
     if args.nomask_checkpoint and os.path.exists(args.nomask_checkpoint):
         print(f"--> Loading No-Mask checkpoint from '{args.nomask_checkpoint}'...")
-        nomask_model = ActorCritic(model_cfg).to(device)
-        ckpt = torch.load(args.nomask_checkpoint, map_location=device)
-        nomask_model.load_state_dict(ckpt.get("model_state", ckpt))
+        nomask_model = AutoregressiveActorCritic(merged_cfg).to(device)
+        ckpt = torch.load(args.nomask_checkpoint, map_location=device, weights_only=False)
+        nomask_model.load_state_dict(ckpt.get("model_state", ckpt), strict=False)
         nomask_model.eval()
-        solvers["No-Mask"] = nomask_model
+        solvers["No-Mask Ablation"] = nomask_model
+
+
 
     # 2. Define 6 Controlled Temporal Stress Regimes
     scenarios = {
@@ -181,13 +206,26 @@ def main():
 
                     if isinstance(solver, torch.nn.Module):
                         disable_m = (s_name == "No-Mask")
-                        node_f, edge_i, node_h, cnf_f, mask = obs_to_tensors(obs, edge_index_np, device, disable_mask=disable_m)
+                        node_f, edge_i, node_h, cnf_f, mask, cnf_order, cnf_active = obs_to_tensors(
+                            obs, edge_index_np, device, disable_mask=disable_m
+                        )
                         t0 = time.perf_counter()
                         with torch.no_grad():
-                            actions, _, _, _ = solver.get_action_and_value(node_f, edge_i, node_h, cnf_f, action_mask=mask)
+                            if isinstance(solver, AutoregressiveActorCritic):
+                                actions, _, _, _ = solver.get_action_and_value(
+                                    node_f, edge_i, node_h, cnf_f,
+                                    action_mask=mask,
+                                    cnf_order=cnf_order,
+                                    cnf_active=cnf_active,
+                                )
+                            else:
+                                actions, _, _, _ = solver.get_action_and_value(
+                                    node_f, edge_i, node_h, cnf_f, action_mask=mask
+                                )
                         t_ms = (time.perf_counter() - t0) * 1000.0
                         action_np = actions.squeeze(0).cpu().numpy()
                         obs, reward, term, trunc, info = env.step(action_np)
+
 
                     elif isinstance(solver, RandomValidSolver):
                         t0 = time.perf_counter()
