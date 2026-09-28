@@ -161,6 +161,29 @@ class AutoregressiveActorCritic(nn.Module):
             nn.Linear(256, 1),
         )
 
+        # ── Normalization scale factors for the dynamic residual-capacity mask ──
+        # The generator normalizes node and CNF resources with DIFFERENT maxima:
+        #   node_features[..., 0-2] are divided by node_range max  (e.g. / 60 cores)
+        #   cnf_features[...,  0-2] are divided by cnf_range max   (e.g. /  3 cores)
+        # Before comparing them in the decoder's residual mask we must bring them
+        # to the same physical unit.  Multiplying CNF dims by (cnf_max / node_max)
+        # converts cnf-normalized demand into node-normalized space.
+        # Example: CNF demands 2 cores → 2/3 = 0.667 in cnf-space.
+        #          Node has 10 cores free → 10/60 = 0.167 in node-space.
+        #          After rescaling: cnf_demand_node_space = 0.667 × (3/60) = 0.033.
+        #          Now 0.167 >= 0.033 → correctly feasible.
+        env_cfg   = cfg                                                        # flat layout
+        cpu_node  = float(env_cfg.get("cpu_range",         [20,  60  ])[1])   # 60
+        ram_node  = float(env_cfg.get("ram_range",         [32,  128 ])[1])   # 128
+        stor_node = float(env_cfg.get("storage_range",     [100, 1000])[1])   # 1000
+        cpu_cnf   = float(env_cfg.get("cnf_cpu_range",     [0.5, 3.0 ])[1])   # 3.0
+        ram_cnf   = float(env_cfg.get("cnf_ram_range",     [0.5, 6.0 ])[1])   # 6.0
+        stor_cnf  = float(env_cfg.get("cnf_storage_range", [1,   20.0])[1])   # 20.0
+        # Plain floats (not nn.Parameters) — not updated during training
+        self._cpu_scale  = cpu_cnf  / cpu_node    # 3.0  / 60   = 0.0500
+        self._ram_scale  = ram_cnf  / ram_node    # 6.0  / 128  = 0.0469
+        self._stor_scale = stor_cnf / stor_node   # 20.0 / 1000 = 0.0200
+
     def get_action_and_value(
         self,
         node_features: torch.Tensor,             # (B, C_max, 9)
@@ -190,15 +213,18 @@ class AutoregressiveActorCritic(nn.Module):
         if cnf_active is None:
             cnf_active = torch.ones(B, M_max, dtype=torch.bool, device=device)
 
-        # 3. Extract normalized capacity tensors from observation arrays
-        # node_features dims 0-2: [cpu_avail_norm, ram_avail_norm, stor_avail_norm]
-        node_cpu  = node_features[..., 0]    # (B, C_max)
+        # 3. Extract capacity tensors for the dynamic residual-capacity mask.
+        #    Node capacity is in node-normalized space [0, 1] (÷ node_range max).
+        #    CNF demand is in cnf-normalized space [0, 1]  (÷ cnf_range max).
+        #    Re-scale CNF dims 0-2 by (cnf_max / node_max) before comparison so
+        #    both quantities live in the same unit-normalized space.
+        node_cpu  = node_features[..., 0]                          # (B, C_max)
         node_ram  = node_features[..., 1]
         node_stor = node_features[..., 2]
-        # cnf_features dims 0-2: [cpu_demand_norm, ram_demand_norm, stor_demand_norm]
-        cnf_cpu   = cnf_features[..., 0]     # (B, M_max)
-        cnf_ram   = cnf_features[..., 1]
-        cnf_stor  = cnf_features[..., 2]
+
+        cnf_cpu   = cnf_features[..., 0] * self._cpu_scale         # (B, M_max)
+        cnf_ram   = cnf_features[..., 1] * self._ram_scale
+        cnf_stor  = cnf_features[..., 2] * self._stor_scale
 
         # 4. Autoregressive sequential decode
         actions, log_probs, entropies = self.decoder(
@@ -217,6 +243,8 @@ class AutoregressiveActorCritic(nn.Module):
         value = self.critic(global_emb)       # (B, 1)
 
         return actions, log_probs, entropies, value
+
+
 
     def get_value(
         self,

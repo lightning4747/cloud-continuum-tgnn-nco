@@ -65,6 +65,8 @@ class ContinuumEnv(gym.Env):
         self.current_step = 0
         self._dist_matrix = None
         self._pred_matrix = None
+        self._path_bottleneck_bw = None  # (n_act, n_act) raw Mbps — set by _update_shortest_paths
+
 
         # Resource allocation tracking
         self.node_cpu_allocated = np.zeros(self.c_max, dtype=np.float32)
@@ -75,13 +77,19 @@ class ContinuumEnv(gym.Env):
         # Placed SFC resource allocation map: sfc_id -> dict of allocations
         self.placed_sfc_allocations: dict[int, dict] = {}
 
-        # Migration cost tracker: which node each CNF slot was placed on last step
-        # -1 means the CNF slot is new (no previous placement → zero migration cost)
-        self.cnf_prev_node = np.full(self.m_max, -1, dtype=np.int32)
+        # Migration cost tracker: which node each logical CNF was placed on last step.
+        # Key: (sfc_id, sfc_position) — stable identity across slot reassignments.
+        # Value: int node index.  Missing key = new arrival → zero migration cost.
+        # BUG FIX: the previous implementation indexed by flat slot m, meaning a new
+        # SFC that lands in the same slot as a just-retired SFC would incorrectly
+        # inherit the retired SFC's last placement and be charged a migration penalty.
+        self.cnf_placement_history: dict[tuple[int, int], int] = {}
 
     def _update_shortest_paths(self):
         """
         Precomputes all-pairs shortest path distance and predecessor matrices using Floyd-Warshall.
+        Also builds _path_bottleneck_bw (n_act × n_act, raw Mbps): the bottleneck (minimum
+        edge BW) along each shortest path, used by compute_migration_cost (Bug Fix #3).
         """
         n_act = self.current_state.n_active_nodes
         adj = np.full((n_act, n_act), np.inf, dtype=np.float64)
@@ -98,6 +106,33 @@ class ContinuumEnv(gym.Env):
         self._dist_matrix = dist
         self._pred_matrix = pred
 
+        # Build path bottleneck BW matrix: bottleneck_bw[u, v] = min edge BW along
+        # the shortest latency path from u to v (raw Mbps, denormalized).
+        # Needed by compute_migration_cost to correctly model multi-hop migrations.
+        bw_raw = self.current_state.edge_bw[:n_act, :n_act]  # raw Mbps (denormalized)
+        bottleneck = np.zeros((n_act, n_act), dtype=np.float32)
+        for u in range(n_act):
+            for v in range(n_act):
+                if u == v or np.isinf(dist[u, v]):
+                    bottleneck[u, v] = 0.0
+                    continue
+                # Trace path u → v via predecessor matrix
+                min_bw = np.inf
+                curr = v
+                while curr != u:
+                    p = pred[u, curr]
+                    if p < 0:
+                        min_bw = 0.0
+                        break
+                    link_bw = float(bw_raw[p, curr])
+                    if link_bw < min_bw:
+                        min_bw = link_bw
+                    curr = p
+                bottleneck[u, v] = float(min_bw) if not np.isinf(min_bw) else 0.0
+        self._path_bottleneck_bw = bottleneck  # (n_act, n_act) raw Mbps
+
+
+
     def reset(self, seed: int | None = None, exogenous_trace: ExogenousTrace | None = None, options: dict | None = None) -> tuple[dict, dict]:
         super().reset(seed=seed)
         self.current_step = 0
@@ -109,8 +144,8 @@ class ContinuumEnv(gym.Env):
         self.edge_bw_allocated.fill(0.0)
         self.placed_sfc_allocations.clear()
 
-        # Reset migration tracker: all CNF slots are "new" at episode start
-        self.cnf_prev_node.fill(-1)
+        # Reset migration tracker: all CNF identities are fresh at episode start
+        self.cnf_placement_history.clear()
 
         self.current_state, self.current_sfcs = self.generator.reset(seed=seed, exogenous_trace=exogenous_trace)
         self.state_buffer.reset(self.current_state)
@@ -141,18 +176,33 @@ class ContinuumEnv(gym.Env):
         cost = self._compute_deployment_cost(placement_matrix)
         latency_penalty, e2e_latencies = self._compute_latency_penalty(placement_matrix)
 
-        # 2b. Migration cost: penalty for CNFs that move to a different node vs. last step
+
+        # 2b. Migration cost: penalty for CNFs that move to a different node vs. last step.
+        # Build a per-slot prev_node view keyed by (sfc_id, sfc_position) so that
+        # a new SFC occupying the same slot as a just-retired SFC does NOT inherit
+        # the retired SFC's placement history (Bug Fix #2).
         if cap_feasible:
+            cnf_prev_node_view = np.full(self.m_max, -1, dtype=np.int32)
+            sfcs = self.current_sfcs
+            for m in range(self.m_max):
+                if sfcs.cnf_active[m]:
+                    key = (int(sfcs.sfc_id[m]), int(sfcs.sfc_position[m]))
+                    if key in self.cnf_placement_history:
+                        cnf_prev_node_view[m] = self.cnf_placement_history[key]
+                    # else: -1 (new arrival, zero migration cost — correct)
+
             migration_penalty = compute_migration_cost(
                 placement_matrix=placement_matrix,
-                cnf_prev_node=self.cnf_prev_node,
-                cnf_active=self.current_sfcs.cnf_active,
-                cnf_ram=self.current_sfcs.cnf_ram,
+                cnf_prev_node=cnf_prev_node_view,
+                cnf_active=sfcs.cnf_active,
+                cnf_ram=sfcs.cnf_ram,
                 edge_bw=self.current_state.edge_bw,
+                path_bottleneck_bw=self._path_bottleneck_bw,  # multi-hop aware BW (Bug Fix #3)
                 bw_range_max=self.cfg.get("bw_range", [2500, 10000])[1],
                 alpha_mig=self.cfg.get("alpha_mig", 0.5),
                 dirty_ratio=self.cfg.get("dirty_ratio", 0.20),
             )
+
         else:
             migration_penalty = 0.0
 
@@ -161,12 +211,13 @@ class ContinuumEnv(gym.Env):
         # 3. Commit Resource Allocations if capacity feasible
         if cap_feasible:
             self._commit_resource_allocations(placement_matrix)
-            # Update migration tracker: record where each active CNF was placed this step
+            # Update migration history: record where each active CNF was placed,
+            # keyed by (sfc_id, sfc_position) so slot reassignments don't corrupt history.
+            sfcs = self.current_sfcs
             for m in range(self.m_max):
-                if self.current_sfcs.cnf_active[m]:
-                    self.cnf_prev_node[m] = int(np.argmax(placement_matrix[m]))
-                else:
-                    self.cnf_prev_node[m] = -1  # inactive slot → no previous placement
+                if sfcs.cnf_active[m]:
+                    key = (int(sfcs.sfc_id[m]), int(sfcs.sfc_position[m]))
+                    self.cnf_placement_history[key] = int(np.argmax(placement_matrix[m]))
 
 
         # 4. Push current state t to state buffer BEFORE advancing state to t+1
@@ -181,6 +232,7 @@ class ContinuumEnv(gym.Env):
             self.edge_bw_allocated,
         )
 
+
         # 6. Release resources for retired SFCs
         for sfc in retired_sfcs:
             sid = sfc["sfc_id"]
@@ -194,6 +246,12 @@ class ContinuumEnv(gym.Env):
                 for u, v, rate in alloc["bw_allocs"]:
                     self.edge_bw_allocated[u, v] = max(0.0, self.edge_bw_allocated[u, v] - rate)
                     self.edge_bw_allocated[v, u] = max(0.0, self.edge_bw_allocated[v, u] - rate)
+
+            # Purge migration history entries for this retired SFC to prevent
+            # unbounded dict growth and avoid spurious lookups on future SFCs.
+            n_cnfs = len(sfc.get("cnfs", []))
+            for pos in range(n_cnfs):
+                self.cnf_placement_history.pop((sid, pos), None)
 
         self._update_shortest_paths()
 
