@@ -74,7 +74,7 @@
 % ABSTRACT
 % ==============================================================================
 \begin{abstract}
-The orchestration of Service Function Chains (SFCs) composed of Cloud-Native Network Functions (CNFs) across heterogeneous Cloud-Continuum infrastructure (Edge, Fog, Cloud) is a cornerstone of 5G and emerging 6G mobile networks. However, joint placement optimization under dynamic network conditions remains fundamentally bounded by two unaddressed bottlenecks: the non-stationary temporal fluctuations of continuum compute and link capacities, and the transient service disruptions caused by uncoordinated stateful CNF migration. Existing optimization paradigms, including Mixed-Integer Linear Programming (MILP), greedy heuristics, and emerging Denoising Diffusion Probabilistic Models (DDPM), treat placement either as static snapshot matching or ignore dynamic application state (active session contexts, socket buffers, ephemeral memory), yielding severe placement-cost penalties and SLA violations. In this paper, we propose \textbf{TGNN-NCO}, an end-to-end framework combining Spatio-Temporal Graph Neural Networks (TGNN) with Actor-Critic Neural Combinatorial Optimization (NCO) and an autoregressive pointer decoder. Our approach couples vectorized spatial graph convolutions with a temporal Gated Recurrent Unit (GRU) across a chronological sliding window ($W=5$) to track continuous network drift. To ensure strict SLA compliance, we design an autoregressive pointer decoder with Service-Function-Chain-priority ordering (tightest-budget first) and dynamic residual-capacity masking, mathematically guaranteeing zero node capacity violations by construction. Furthermore, we incorporate an analytical dirty-memory state migration penalty into the objective function to discourage detrimental container relocations. Extensive empirical evaluations across six temporal stress scenarios demonstrate that TGNN-NCO achieves a \textbf{98.5\%} feasibility rate (outperforming static GNNs by 14.3\% and greedy heuristics by up to 27.5\%), maintains sub-linear inference time ($\mathbf{\le 5.1}$\,ms for 100 continuum nodes, offering a $23,500\times$ speedup over exact MILP), and preserves a tight optimality gap bounded within $\mathbf{0\%}$ to $\mathbf{5\%}$ of the theoretical ground truth.
+The orchestration of Service Function Chains (SFCs) composed of Cloud-Native Network Functions (CNFs) across heterogeneous Edge-Fog-Cloud infrastructure requires jointly optimizing deployment cost, end-to-end latency, and container migration overhead under non-stationary network conditions. Existing placement approaches based on static optimization or unconstrained heuristic routing often overlook continuous temporal drift and transient state-transfer delays, leading to degraded quality-of-service and capacity collisions. In this paper, we present \textbf{TGNN-NCO}, an actor-critic neural combinatorial optimization framework for dynamic CNF placement across the cloud continuum. TGNN-NCO integrates a spatio-temporal graph neural network encoder with an autoregressive pointer decoder. The encoder captures temporal load fluctuations across a sliding window ($W=5$) using spatial graph convolutions and gated recurrent units, while the decoder enforces hard node capacity constraints (CPU, RAM, storage) through dynamic residual-capacity action masking during sequential chain decoding. Furthermore, an analytical pre-copy dirty-memory state migration penalty is integrated into the reinforcement learning objective to discourage unnecessary container relocations. We evaluate TGNN-NCO across six controlled temporal stress scenarios in a continuous simulation environment. Experimental results indicate that TGNN-NCO achieves high feasibility rates across varying workloads, sub-5.1\,ms decision latency on 100-node continuum graphs (over three orders of magnitude faster than exact solvers), and substantially lower migration overhead compared to static GNN, greedy, and diffusion-based baselines.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -87,13 +87,13 @@ Cloud Continuum, Cloud-Native Network Functions (CNFs), Service Function Chainin
 \section{Introduction}
 \label{sec:intro}
 
-The continuous evolution of mobile telecommunications toward 5G-Advanced and 6G architectures has accelerated the transition from monolithic telecommunication appliances to Cloud-Native Network Functions (CNFs)~\cite{mijumbi2016network}. Deployed as lightweight, containerized microservices (e.g., User Plane Functions [UPF], Access and Mobility Management Functions [AMF], and edge firewalls), CNFs are sequentially interconnected to form Service Function Chains (SFCs) that enforce specialized packet-processing policies~\cite{herrera2016resource}. Concurrently, physical infrastructure has transitioned into a highly distributed \textit{Cloud Continuum}, spanning resource-constrained Edge access points, intermediate Fog aggregation clusters, and centralized hyperscale Data Centers (Cloud).
+The transition toward 5G-Advanced and 6G service-based architectures has accelerated the deployment of containerized Cloud-Native Network Functions (CNFs)~\cite{mijumbi2016network}. Deployed as modular microservices (e.g., User Plane Functions [UPF], Access and Mobility Management Functions [AMF], and edge firewalls), CNFs are sequentially interconnected to form Service Function Chains (SFCs) that enforce specialized packet-processing policies~\cite{herrera2016resource}. Concurrently, physical infrastructure has evolved into a distributed \textit{Cloud Continuum}, spanning resource-constrained Edge access points, intermediate Fog aggregation clusters, and centralized hyperscale Data Centers (Cloud).
 
-Operating SFCs across this heterogeneous continuum introduces a multi-dimensional, NP-hard combinatorial optimization problem: mapping ordered CNF instances onto physical computing nodes while minimizing operational deployment costs and packet traversal latency, subject to strict multi-resource capacities (CPU, RAM, Storage) and link bandwidth constraints. This challenge is substantially compounded by two real-world phenomena:
+Operating SFCs across this heterogeneous continuum poses an NP-hard combinatorial optimization problem: mapping ordered CNF instances onto physical computing nodes while minimizing operational deployment costs and packet traversal latency, subject to strict multi-resource capacities (CPU, RAM, Storage) and link bandwidth constraints~\cite{peixoto2020survey}. This challenge is compounded by two practical operational dynamics:
 
 \begin{enumerate}
-    \item \textbf{Continuous Non-Stationary Temporal Dynamics:} Available compute resources, background traffic loads, and communication link latencies across the continuum fluctuate rapidly over time due to user mobility, fluctuating diurnal traffic, and stochastic node failures. Classical static optimizers produce placements that rapidly degrade into SLA violations within minutes of deployment.
-    \item \textbf{Dynamic Application State and Migration Overhead:} Unlike stateless web services, core network CNFs maintain significant volatile application state, including active subscriber session tables, in-flight TCP socket buffers, encryption contexts, and ephemeral memory pages~\cite{clark2005live}. Moving a containerized CNF to an alternate compute node incurs severe pre-copy dirty-memory transfer delays and transient link bandwidth saturation. When algorithmic schedulers neglect this state migration penalty, the latency savings gained from relocations are completely negated by state-transfer-induced service disruptions.
+    \item \textbf{Continuous Non-Stationary Temporal Dynamics:} Available compute resources, background traffic loads, and communication link latencies across the continuum fluctuate over time due to user mobility, diurnal traffic shifts, and stochastic node failures. Static placement strategies produce mappings that degrade as network loads drift away from initial observation states.
+    \item \textbf{Dynamic Application State and Migration Overhead:} Unlike stateless web microservices, core telecommunication CNFs maintain volatile session state, including subscriber session tables, in-flight TCP socket buffers, encryption contexts, and ephemeral memory pages~\cite{clark2005live}. Relocating an active CNF to an alternate compute node incurs pre-copy dirty-memory transfer delays and transient link bandwidth utilization. When schedulers omit this migration penalty from the placement objective, theoretical latency gains from relocation can be negated by state-transfer-induced service disruptions.
 \end{enumerate}
 
 \begin{figure*}[t]
@@ -103,21 +103,22 @@ Operating SFCs across this heterogeneous continuum introduces a multi-dimensiona
 \label{fig:training_convergence}
 \end{figure*}
 
-Current literature treats CNF placement predominantly through two isolated perspectives. On one hand, inter-domain federation frameworks (such as GSMA Operator Platforms, 3GPP Service-Based Architecture, and O-RAN near-RT RICs) standardize cross-operator control-plane signaling and container lifecycle hooks~\cite{dalgitsis2024federation, gsma_opg01, 3gpp_ts23501, oran_arch}. However, these frameworks focus strictly on administrative negotiation and lack algorithmic intelligence for dynamic, state-aware placement optimization. On the other hand, intra-domain algorithmic schedulers have recently leveraged Denoising Diffusion Probabilistic Models (DDPM) coupled with Graph Neural Networks (GNNs)~\cite{vazquez2025cnfp, ho2020denoising}. While capable of generating structured assignment matrices, diffusion models require dozens of iterative stochastic reverse-sampling steps, rendering them too computationally slow for real-time edge control ($>1$\,second). Moreover, diffusion models enforce resource limits via soft penalty guidance, frequently yielding constraint-violating assignments under tight capacity regimes, while ignoring temporal state history and dirty-memory transfer penalties.
+Existing literature approaches CNF placement primarily through two perspectives. On one hand, inter-domain federation frameworks (such as GSMA Operator Platforms, 3GPP Service-Based Architecture, and O-RAN near-RT RICs) standardize cross-operator signaling and container lifecycle interfaces~\cite{dalgitsis2024federation, gsma_opg01, 3gpp_ts23501, oran_arch}. However, these frameworks focus on administrative lifecycle negotiation rather than dynamic, multi-constraint placement optimization. On the other hand, intra-domain algorithmic schedulers have recently explored combinatorial solvers, Deep Reinforcement Learning (DRL)~\cite{gu2019knowledge, sun2020deep}, and emerging diffusion models~\cite{sun2023difusco, ho2020denoising}. While diffusion-based methods generate structured assignment matrices, their iterative reverse-sampling steps often require hundreds of milliseconds to seconds, limiting real-time applicability in edge environments. Furthermore, unconstrained generative formulations rely on soft loss penalties that can produce capacity collisions under tight load regimes, while frequently omitting temporal state history and dirty-memory transfer penalties.
 
-To address these fundamental limitations, we propose \textbf{TGNN-NCO}, an end-to-end framework combining Spatio-Temporal Graph Neural Networks (TGNN) with Neural Combinatorial Optimization (NCO) for near real-time, state-aware CNF placement across the cloud continuum. TGNN-NCO captures continuous network drift through a sliding-window temporal graph encoder and utilizes an autoregressive pointer decoder with dynamic residual-capacity masking to guarantee zero capacity violations by construction.
+To address these challenges, we present \textbf{TGNN-NCO}, a framework combining Spatio-Temporal Graph Neural Networks (TGNN) with Neural Combinatorial Optimization (NCO) for near real-time, state-aware CNF placement across the cloud continuum. TGNN-NCO captures continuous network drift through a sliding-window temporal graph encoder and utilizes an autoregressive pointer decoder with dynamic residual-capacity masking to eliminate intra-step node capacity collisions.
 
 \subsection{Contributions}
 The specific contributions of this work are summarized as follows:
 \begin{itemize}
     \item \textbf{State-Aware Multi-Objective Formulation:} We formalize the dynamic cloud-continuum CNF placement problem incorporating an analytical dirty-memory pre-copy migration penalty, jointly optimizing compute expenditure, traversal delay, and state-transfer overhead under non-stationary continuum dynamics.
-    \item \textbf{Spatio-Temporal Graph Neural Network Architecture:} We design a vectorized TGNN encoder that merges spatial graph convolutions over Waxman network topologies with temporal Gated Recurrent Units (GRU) operating on a sliding window ($W=5$), capturing both spatial network topology and non-stationary resource fluctuations.
-    \item \textbf{Autoregressive Pointer Decoder with Hard Feasibility Guarantees:} We introduce an autoregressive cross-attention decoder operating under an SFC-priority sequence (tightest delay budget first) paired with a dynamic residual-capacity action mask. This ensures that node CPU, RAM, and Storage constraints are strictly satisfied by construction ($0\%$ violation) without relying on heuristic repair.
-    \item \textbf{Curriculum-Annealed Reinforcement Learning:} We formulate a Proximal Policy Optimization (PPO) pipeline with Generalized Advantage Estimation (GAE) and curriculum penalty annealing ($\beta(t)$), enabling stable convergence from random exploration to near-optimal, high-feasibility policies.
-    \item \textbf{Comprehensive Empirical Benchmarking:} We benchmark TGNN-NCO against exact Mixed-Integer Non-Linear Programming (GEKKO MINLP), greedy heuristics, and neural ablations across six exogenous temporal stress regimes. Our framework delivers a \textbf{98.5\%} feasibility rate, sub-5.1\,ms inference latency ($23,500\times$ faster than MINLP at $N=100$), and an optimality gap strictly bounded within $0\%$ to $5\%$.
+    \item \textbf{Spatio-Temporal Graph Neural Network Architecture:} We design a vectorized TGNN encoder that merges spatial graph convolutions over network topologies with temporal Gated Recurrent Units (GRU) operating on a sliding window ($W=5$), capturing both spatial network topology and non-stationary resource fluctuations.
+    \item \textbf{Constrained Action Decoding via Residual Capacity Masking:} We introduce an autoregressive cross-attention decoder operating under an SFC-priority sequence (tightest delay budget first) paired with a dynamic residual-capacity action mask. This ensures that node CPU, RAM, and Storage constraints are strictly observed during sequential decoding without requiring post-hoc heuristic repair.
+    \item \textbf{Curriculum-Annealed Reinforcement Learning:} We formulate a Proximal Policy Optimization (PPO) pipeline with Generalized Advantage Estimation (GAE) and curriculum penalty annealing ($\beta(t)$), enabling stable convergence from initial exploration to feasible, low-latency placement policies.
+    \item \textbf{Empirical Benchmarking Across Temporal Stress Regimes:} We benchmark TGNN-NCO against exact Mixed-Integer Non-Linear Programming (GEKKO MINLP), greedy heuristics, and neural ablations across six exogenous temporal stress regimes. Our framework achieves high feasibility rates across varying workloads, sub-5.1\,ms inference latency on 100-node graphs (over three orders of magnitude faster than exact MINLP solvers), and near-optimal placement costs.
 \end{itemize}
 
 The remainder of this paper is organized as follows. Section~\ref{sec:related} reviews related work and identifies the dynamic application state gap. Section~\ref{sec:model} formalizes the system model and problem formulation. Section~\ref{sec:method} details the proposed TGNN-NCO architecture and training algorithms. Section~\ref{sec:system} presents the system design and implementation details. Section~\ref{sec:eval} outlines the experimental methodology. Section~\ref{sec:results} presents the empirical results and ablations. Section~\ref{sec:discussion} discusses limitations and practical considerations, and Section~\ref{sec:conclusion} concludes the paper.
+
 
 % ==============================================================================
 % SECTION II: RELATED WORK & RESEARCH GAP
@@ -144,25 +145,25 @@ Recently, Deep Reinforcement Learning (DRL) and Deep Generative Models have emer
 \begin{itemize}
     \item \textbf{Graph Neural Networks (GNNs):} Kipf \& Welling~\cite{kipf2017semi} and Hamilton et al.~\cite{hamilton2017inductive} established graph convolution methods capable of embedding network topologies. In telecom networks, spatial GNNs have been deployed to predict traffic bottlenecks and recommend resource allocations.
     \item \textbf{Neural Combinatorial Optimization (NCO):} Vinyals et al.~\cite{vinyals2015pointer} introduced Pointer Networks, later adapted with reinforcement learning by Bello et al.~\cite{bello2016neural} and Kool et al.~\cite{kool2018attention} to solve Traveling Salesperson and vehicle routing problems using attention mechanisms.
-    \item \textbf{Diffusion Models for Placement (DDPM):} Vázquez-Rodríguez et al.~\cite{vazquez2025cnfp} pioneered the CNFP framework, framing CNF placement as conditional continuous-to-discrete matrix denoising using Denoising Diffusion Probabilistic Models (DDPM)~\cite{ho2020denoising, song2020score}.
+    \item \textbf{Diffusion and Generative Solvers:} Deep generative models and graph diffusion frameworks, such as DIFUSCO~\cite{sun2023difusco}, frame combinatorial problems as continuous-to-discrete score matching~\cite{ho2020denoising, song2020score}. While capable of modeling complex topological distributions, reverse diffusion requires iterative denoising trajectories (often 50--100 steps) that impose latency hurdles for real-time edge control.
 \end{itemize}
 
 \subsection{The Unaddressed Research Gap: Dynamic Application State}
-Despite these advancements, an acute architectural gap exists between federation protocols and algorithmic placement models, as summarized in Table~\ref{tab:gap_matrix}. Current state-of-the-art placement models (including DDPM and static GNNs) treat CNFs as stateless, ephemeral compute tasks. In reality, telecom microservices maintain rich, dynamic application states consisting of:
+Despite these advancements, an architectural gap remains between federation protocols and algorithmic placement models, as summarized in Table~\ref{tab:gap_matrix}. Existing placement formulations (including standard heuristic schedulers and static GNN embeddings) predominantly treat CNFs as stateless, ephemeral compute tasks. In operational telecommunication deployments, however, network microservices maintain volatile state contexts:
 \begin{enumerate}
     \item \textbf{Active Subscriber Session Contexts:} GPRS Tunneling Protocol (GTP-U) state, subscriber IP bindings, and charging records within UPF and AMF instances.
     \item \textbf{In-Flight TCP/IP Socket Buffers:} Ephemeral connection state, sequence numbers, and unacknowledged segment buffers in edge firewalls and load balancers.
     \item \textbf{Dynamic In-Memory Caches:} Ephemeral RAM state in distributed edge caching and inference microservices.
 \end{enumerate}
 
-Neglecting this volatile application state causes three catastrophic operational failures:
+Neglecting this volatile application state can lead to operational challenges:
 \begin{itemize}
-    \item \textbf{State Disruption during Mobility Handoffs:} Re-instantiating or relocating CNFs across operator nodes drops active connections if state is not synchronously transferred, causing session breakage for mission-critical CAM/C-V2X flows.
-    \item \textbf{Severe Placement Cost Penalties:} Relocating a container to a node with lower theoretical latency induces transient link saturation and prolonged packet queues while transferring multi-gigabyte memory payloads, turning an apparent optimization gain into an overall SLA violation.
-    \item \textbf{Bandwidth Synchronization Overhead:} Uncontrolled in-band state synchronization across constrained edge-to-cloud links degrades available user bandwidth.
+    \item \textbf{Session Degradation During Mobility Handoffs:} Re-instantiating or relocating CNFs across operator nodes interrupts active sessions if memory context is not synchronously transferred.
+    \item \textbf{Unintended Migration Overhead:} Relocating a container to an edge node with lower nominal propagation latency incurs dirty-memory transfer delay and bandwidth consumption, counteracting the expected latency improvement.
+    \item \textbf{Link Bandwidth Contention:} In-band state synchronization across bandwidth-constrained edge links competes directly with active user plane data traffic.
 \end{itemize}
 
-Furthermore, existing DDPM-based methods require dozens of sequential diffusion iterations ($>1$\,second), making them too slow to react to continuous network fluctuations, and rely on soft loss penalties that fail to guarantee hard capacity constraint satisfaction. Our work directly Bridges this gap by integrating an analytical dirty-memory state migration model into an ultra-fast, zero-violation Spatio-Temporal NCO framework.
+Furthermore, iterative generative baselines require multiple sampling steps ($>1$\,second), while soft loss penalties may permit occasional constraint violations under tight capacity margins. Our framework addresses these considerations by coupling an analytical pre-copy dirty-memory migration model with a lightweight, autoregressive spatio-temporal NCO pipeline.
 
 \begin{table*}[t]
 \caption{System Integration Matrix: Comparison of Placement Paradigms}
@@ -173,14 +174,15 @@ Furthermore, existing DDPM-based methods require dozens of sequential diffusion 
 \textbf{Architectural Paradigm} & \textbf{Core Mechanism} & \textbf{Inference Speed} & \textbf{Constraint Handling} & \textbf{Dynamic State Treatment} \\
 \midrule
 \textbf{Inter-Domain Federation}~\cite{dalgitsis2024federation, gsma_opg01} & GSMA OP \& SFaaS Lifecycle Hooks & Minutes (Control Plane) & Manual / Template-Based & Relies on external sync; causes session disruption \\
-\textbf{Exact Solvers (MINLP)}~\cite{beal2018gekko} & Branch-and-Bound / Interior Point & Exponential ($>100$\,s at $N=50$) & Hard Mathematical Proof & Static snapshot only; state ignored \\
-\textbf{Heuristics (Greedy FFD)} & Rule-based demand sorting & Ultra-fast ($<1$\,ms) & Hard checks (heuristic fallback) & Completely neglected \\
-\textbf{Diffusion Placement (DDPM)}~\cite{vazquez2025cnfp} & Iterative Reverse Gaussian Denoising & Slow (50--100 steps, $\approx 1.5$\,s) & Soft penalty loss guidance & Ignored; models static graphs only \\
+\textbf{Exact Solvers (MINLP)}~\cite{beal2018gekko} & Branch-and-Bound / Interior Point & Exponential ($>100$\,s at $N=50$) & Hard Mathematical Formulation & Static snapshot only; state ignored \\
+\textbf{Heuristics (Greedy FFD)} & Rule-based demand sorting & Fast ($<1$\,ms) & Sequential capacity check & Omitted \\
+\textbf{Diffusion Graph Solvers}~\cite{sun2023difusco} & Iterative Reverse Gaussian Denoising & Slow (50--100 steps, $\approx 1.5$\,s) & Soft penalty loss guidance & Ignored; models static graphs only \\
 \midrule
-\textbf{TGNN-NCO (Proposed)} & \textbf{Spatio-Temporal GNN + Pointer NCO} & \textbf{Real-Time ($\le 5.1$\,ms at $N=100$)} & \textbf{Zero-violation mask by construction} & \textbf{Explicit dirty-memory migration model} \\
+\textbf{TGNN-NCO (Proposed)} & \textbf{Spatio-Temporal GNN + Pointer NCO} & \textbf{Real-Time ($\le 5.1$\,ms at $N=100$)} & \textbf{Residual capacity action mask} & \textbf{Explicit dirty-memory migration model} \\
 \bottomrule
 \end{tabularx}
 \end{table*}
+
 
 % ==============================================================================
 % SECTION III: SYSTEM MODEL & PROBLEM FORMULATION
@@ -232,6 +234,31 @@ In addition, stochastic events govern infrastructure availability:
     \item \textbf{Node Failures and Recoveries:} Nodes fail stochastically with probability $p_{\text{fail}} = 0.01$ per step, dropping all hosted CNFs and triggering immediate re-orchestration.
     \item \textbf{SFC Lifecycle Churn:} Active SFCs complete and retire with probability $p_{\text{retire}} = 0.10$ upon reaching their Time-To-Live ($\text{TTL}_h \in [10, 40]$ steps), releasing committed allocations, while new SFC requests arrive stochastically with probability $p_{\text{arr}} = 0.30$.
 \end{itemize}
+
+
+\begin{table}[t]
+\caption{Simulation Environment \& Neural Hyperparameter Configurations}
+\label{tab:hyperparams}
+\centering
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter / Environmental Factor} & \textbf{Nominal Value / Setting} \
+\midrule
+Continuum Graph Topologies $|V|$ &  = 20$ to 00$ nodes (Nominal 50) \
+Infrastructure Tiers (Edge / Fog / Cloud) & 0\%$ Edge / 0\%$ Fog / 0\%$ Cloud \
+Per-Node Capacities (CPU / RAM / Stor) & 32$ cores / 128$\,GB / 1000$\,GB \
+Cost Rates $\kappa_i$ (Edge / Fog / Cloud) & $0.05 / $0.10 / $0.20 per core-hour \
+Link Bandwidth \& Propagation Latency & {ij} \in [100, 10000]$\,Mbps, {ij} \in [1, 100]$\,ms \
+Ornstein-Uhlenbeck Parameters ($\theta, \sigma$) & $\theta = 0.15, \sigma_{\text{cpu}} = 2.0, \sigma_{\text{ram}} = 5.0$ \
+Dirty-Memory Transfer ($\rho, \alpha_{\text{mig}}$) & $\rho = 0.20$ (0\%$ dirty RAM), $\alpha_{\text{mig}} = 0.50$ \
+Temporal Sliding Window ($) &  = 5$ historical snapshots \
+Encoder / Decoder Embedding Dimension ($) & {\text{hidden}} = 256$, GNN Layers = 2 \
+Multi-Head Attention Pointer Decoder &  = 8$ heads,  = 32, d_v = 32$ \
+PPO Optimizer \& GAE Parameters & $\gamma = 0.99, \lambda_{\text{GAE}} = 0.95, \epsilon_{\text{clip}} = 0.20$ \
+Curriculum Annealing Schedule $\beta(t)$ & Linear 1.0 to 10.0 (steps 50k to 150k) \
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsection{State Migration Cost Model}
 To faithfully capture the impact of dynamic application state, we ground our migration cost in the classic dirty-memory pre-copy migration formulation~\cite{clark2005live}. Let $u_m(t-1) \in V(t-1) \cup \{-1\}$ denote the physical node hosting CNF $m$ at step $t-1$ (with $-1$ signifying a newly arriving unplaced CNF), and let $v_m(t) \in V(t)$ denote the candidate host node at step $t$.
@@ -406,17 +433,19 @@ Upon sampling or greedily selecting action $a_m = i^*$, the residual capacity of
 \end{equation}
 while all other nodes remain unchanged.
 
-\newtheorem{theorem}{Theorem}
-\begin{theorem}[Zero-Violation Guarantee]
-Under the dynamic residual-capacity masking policy, any discrete placement vector $\mathbf{a}_t = [a_1, \dots, a_{M_{\max}}]^T$ satisfies node-level CPU, RAM, and Storage constraints (C2--C4) with a violation rate of exactly $0\%$ by construction.
-\end{theorem}
-\begin{IEEEproof}
-Let $k \in [1, M_{\max}]$ be the decoding step for CNF $m$. By Eq.~\eqref{eq:dyn_mask}, node $i$ has non-zero probability of selection ($P(a_m = i) > 0$) if and only if $\mathbf{r}_i^{\text{res}}(k) \ge \mathbf{d}_m$. Because $\mathbf{r}_i^{\text{res}}(1) = \mathbf{r}_i(t)$ and $\mathbf{r}_i^{\text{res}}(k+1) = \mathbf{r}_i^{\text{res}}(k) - \mathbf{d}_m \cdot \mathbf{1}_{\{a_m = i\}}$, by induction:
+\subsection{Residual Capacity Invariant and Feasibility Handling}
+A central challenge in sequential multi-CNF placement is avoiding intra-step resource contention: when multiple functions in a chain are scheduled within the same interval, uncoordinated independent decisions can assign multiple CNFs to the same host node, collectively exceeding its physical capacity.
+
+TGNN-NCO resolves this through sequential residual capacity tracking. Specifically, candidate host nodes with insufficient residual capacity are assigned $-\infty$ logits in Eq.~\eqref{eq:dyn_mask}, setting their selection probability to zero: $P(a_m = i) = 0$. Upon selecting action $a_m = i^*$, the host node's residual capacity is updated:
 \begin{equation}
-\sum_{m=1}^{M(t)} \mathbf{d}_m \cdot \mathbf{1}_{\{a_m = i\}} = \mathbf{r}_i(t) - \mathbf{r}_i^{\text{res}}(M_{\max}+1) \le \mathbf{r}_i(t)
+\mathbf{r}_{i^*}^{\text{res}}(k+1) = \mathbf{r}_{i^*}^{\text{res}}(k) - \mathbf{d}_m
 \end{equation}
-since $\mathbf{r}_i^{\text{res}}(k) \ge \mathbf{0}, \forall k$. Thus, accumulated allocations can never exceed available physical capacity.
-\end{IEEEproof}
+Because residual capacities remain non-negative ($\mathbf{r}_i^{\text{res}}(k) \ge \mathbf{0}, \forall k$) and non-compliant nodes are masked prior to sampling, the cumulative resource allocation to any host node $i$ over the scheduling sequence satisfies:
+\begin{equation}
+\sum_{m=1}^{M(t)} \mathbf{d}_m \cdot \mathbf{1}_{\{a_m = i\}} \le \mathbf{r}_i(t), \quad \forall i \in V(t)
+\end{equation}
+This architectural design pattern prevents intra-interval compute capacity over-allocation (constraints C2--C4) directly during decoding, eliminating the need for post-hoc heuristic repair.
+
 
 \subsection{Critic Architecture and PPO Training Loop}
 The Critic network evaluates the global state value $V(\mathbf{s}_t)$ to reduce gradient variance. We apply mean-pooling across the TGNN node embeddings to extract a graph-level representation $\bar{\mathbf{z}} = \frac{1}{C_{\max}} \sum_{i=1}^{C_{\max}} \mathbf{z}_{V, i} \in \mathbb{R}^{d_{\text{model}}}$, which is processed through a 3-layer MLP ($256 \to 512 \to 256 \to 1$):
@@ -481,6 +510,32 @@ where $\mathcal{L}^{\text{VF}} = (V_\phi(\mathbf{s}_t) - R_t^{\text{target}})^2$
 \end{algorithm}
 
 % ==============================================================================
+
+\begin{algorithm}[t]
+\caption{Curriculum-Annealed PPO Policy Training}
+\label{alg:ppo_training}
+\begin{algorithmic}[1]
+\REQUIRE Policy network $\pi_\theta$, value critic \phi$, simulation environment $\mathcal{E}$
+\ENSURE Optimized weights $\theta^*, \phi^*$
+\STATE Initialize network weights $\theta, \phi$; step counter  \leftarrow 0$
+\FOR{iteration  = 1$ \TO {\max}$}
+    \STATE $\beta(k) \leftarrow \min(10.0, 1.0 + 9.0 \cdot (k / K_{\text{anneal}}))$
+    \STATE Collect rollout trajectory of length {\text{horizon}}$ using policy $\pi_\theta$
+    \FOR{each step $ in rollout}
+        \STATE Execute Algorithm~\ref{alg:tgnn_nco} to yield action $\mathbf{a}_t$ and placement cost
+        \STATE Compute augmented reward:  \leftarrow -\text{Cost}(\mathbf{X}_t) - \beta(k) \cdot \text{Violations}(\mathbf{X}_t)$
+    \ENDFOR
+    \STATE Compute Generalized Advantage Estimators $\hat{A}_t$ and returns $
+    \FOR{epoch  = 1$ \TO {\text{ppo}}$}
+        \STATE Compute importance ratio (\theta) \leftarrow \pi_\theta(\mathbf{a}_t \mid \mathbf{s}_t) / \pi_{\theta_{\text{old}}}(\mathbf{a}_t \mid \mathbf{s}_t)$
+        \STATE Update policy weights $\theta$ via clipped surrogate gradient $\nabla_\theta \mathcal{L}^{\text{CLIP}}$
+        \STATE Update critic weights $\phi$ via squared Bellman loss $\nabla_\phi \mathcal{L}^{\text{VF}}$
+    \ENDFOR
+\ENDFOR
+\RETURN Converged weights $\theta^*, \phi^*$
+\end{algorithmic}
+\end{algorithm}
+
 % SECTION V: SYSTEM DESIGN & IMPLEMENTATION
 % ==============================================================================
 \section{System Design \& Implementation}
@@ -562,7 +617,7 @@ We benchmark TGNN-NCO against four algorithmic classes:
     \item \textbf{Neural Ablation 1 (`Static-GNN`):} Uses identical spatial graph convolutions but removes the temporal GRU module ($W=1$), operating strictly on instantaneous state $G(t)$.
     \item \textbf{Neural Ablation 2 (`Flat-RL`):} Standard PPO policy trained on flattened node and CNF feature vectors without graph convolutions or message passing.
     \item \textbf{Neural Ablation 3 (`No-Mask`):} TGNN-NCO trained without action masking, relying solely on negative reward penalties to learn valid placements.
-    \item \textbf{Theoretical Comparison (`DDPM-GNN`):} Diffusion-based conditional matrix generation per Vázquez-Rodríguez et al.~\cite{vazquez2025cnfp}.
+    \item \textbf{Theoretical Generative Comparison (`DDPM-GNN`):} Graph diffusion combinatorial baseline modeled after DIFUSCO~\cite{sun2023difusco}.
 \end{enumerate}
 
 \subsection{Standardized Evaluation Metrics}
@@ -607,19 +662,20 @@ We report empirical findings across in-distribution environments, out-of-distrib
 \end{table*}
 
 \subsection{Feasibility Rate and Constraint Adherence}
-As shown in Fig.~\ref{fig:feasibility_rate} and Table~\ref{tab:main_results}, \textbf{TGNN-NCO achieves a 98.5\% overall feasibility rate}, vastly outperforming competing heuristics and static learning baselines.
+As shown in Fig.~\ref{fig:feasibility_rate} and Table~\ref{tab:main_results}, TGNN-NCO achieves a 98.5\% overall feasibility rate across the evaluated test distribution, outperforming competing heuristics and static learning baselines.
 \begin{itemize}
-    \item \textbf{Superiority over Heuristics:} GreedyFFD achieves only a $71.0\%$ feasibility rate because it packs CNFs based purely on CPU demand without foresight regarding multi-hop path bandwidth or SLA delay budgets. GreedyLatencyAware improves feasibility to $78.4\%$ by routing along shortest paths, but frequently creates severe bottlenecks on high-traffic edge links.
-    \item \textbf{Residual Masking Guarantee:} In TGNN-NCO, capacity violations (CPU, RAM, Storage) remain strictly at \textbf{0\%} across all episodes, confirming Theorem 1. The residual 1.5\% infeasibility in TGNN-NCO stems entirely from rare exogenous link bandwidth saturations occurring during extreme multi-node failure cascades.
+    \item \textbf{Performance Relative to Heuristics:} GreedyFFD achieves a $71.0\%$ feasibility rate because it packs CNFs based purely on CPU demand without foresight regarding multi-hop path bandwidth or SLA delay budgets. GreedyLatencyAware improves feasibility to $78.4\%$ by routing along shortest paths, but creates bottlenecks on high-traffic edge links.
+    \item \textbf{Residual Masking Behavior:} In TGNN-NCO, compute capacity violations (CPU, RAM, Storage) are systematically avoided during decoding due to residual capacity masking. Residual infeasibility in TGNN-NCO (1.5\%) stems from multi-hop link bandwidth saturation that occurs during extreme multi-node failure cascades.
 \end{itemize}
 
 \subsection{Inference Latency and Out-of-Distribution Scalability}
-Real-time orchestration in 5G/6G MEC environments requires sub-10\,ms decision latency to adhere to control-plane loop constraints. Fig.~\ref{fig:inference_time} evaluates inference speed as physical topology size scales out-of-distribution from $N=20$ to $N=100$ nodes:
+Real-time orchestration in edge environments benefits from low decision latency to support rapid reconfiguration. Fig.~\ref{fig:inference_time} evaluates inference speed as physical topology size scales out-of-distribution from $N=20$ to $N=100$ nodes:
 \begin{itemize}
-    \item \textbf{Sub-Linear Scaling:} TGNN-NCO exhibits sub-linear growth, requiring only \textbf{1.2\,ms at $N=20$}, \textbf{2.4\,ms at $N=50$}, and \textbf{5.1\,ms at $N=100$}. This efficiency is driven by our precomputed vectorized adjacency operations and pre-projected cross-attention linear transformations.
-    \item \textbf{Comparison with Baselines:} GreedyLatencyAware scales poorly (from 15.2\,ms to 1,850.0\,ms) due to repeated $\mathcal{O}(V \log V + E)$ Dijkstra queries on large graphs. The exact MINLP solver explodes exponentially, requiring 120\,ms at $N=20$, 5,000\,ms at $N=50$, and reaching 120,000\,ms (2 minutes) at $N=100$. At $N=100$, TGNN-NCO delivers a \textbf{$23,500\times$ speedup} over exact optimization.
-    \item \textbf{Comparison with DDPM:} Whereas diffusion models require 50 to 100 sequential sampling steps ($\approx 1,500$\,ms) to generate placements~\cite{vazquez2025cnfp}, TGNN-NCO's single-pass autoregressive decoder operates $\mathbf{300\times}$ faster, easily fitting within 5G sub-frame control intervals.
+    \item \textbf{Sub-Linear Scaling:} TGNN-NCO exhibits sub-linear growth, requiring \textbf{1.2\,ms at $N=20$}, \textbf{2.4\,ms at $N=50$}, and \textbf{5.1\,ms at $N=100$}. This efficiency is driven by precomputed vectorized adjacency operations and linear attention projections.
+    \item \textbf{Comparison with Baselines:} GreedyLatencyAware requires 15.2\,ms to 1,850.0\,ms due to repeated Dijkstra traversals on larger topologies. The exact MINLP solver exhibits steep growth, requiring 120\,ms at $N=20$, 5,000\,ms at $N=50$, and reaching 120,000\,ms (2 minutes) at $N=100$. At $N=100$, TGNN-NCO delivers an execution time reduction of over four orders of magnitude compared to exact MINLP.
+    \item \textbf{Comparison with Generative Diffusion:} Whereas iterative diffusion models typically require 50 to 100 sequential sampling steps ($\approx 1,500$\,ms)~\cite{sun2023difusco}, TGNN-NCO's single-pass autoregressive decoder computes placement decisions in a single pass ($\le 5.1$\,ms).
 \end{itemize}
+
 
 \subsection{Optimality Gap versus Exact MILP}
 To quantify solution quality, Fig.~\ref{fig:optimality_gap} plots the empirical Cumulative Distribution Function (CDF) of the Optimality Gap compared against the ground-truth GEKKO MINLP solver on solvable instances ($C \le 15, M \le 30$).
@@ -661,9 +717,10 @@ While TGNN-NCO establishes state-of-the-art performance, several practical consi
 \section{Conclusion \& Future Work}
 \label{sec:conclusion}
 
-In this paper, we addressed the dual challenge of continuous network non-stationarity and uncoordinated application state migration in Cloud-Continuum CNF orchestration. We proposed \textbf{TGNN-NCO}, an end-to-end framework uniting Spatio-Temporal Graph Neural Networks, Actor-Critic reinforcement learning, and an autoregressive pointer decoder. By coupling vectorized spatial convolutions with temporal GRU sequence modeling over a sliding window ($W=5$), TGNN-NCO accurately tracks non-stationary load drift. Through SFC-priority ordering and dynamic residual-capacity masking, the framework mathematically guarantees zero node capacity violations by construction. Furthermore, incorporating an analytical dirty-memory pre-copy migration penalty prevents container thrashing and preserves session continuity.
+In this paper, we addressed the dual challenges of continuous network non-stationarity and uncoordinated application state migration in Cloud-Continuum CNF orchestration. We proposed \textbf{TGNN-NCO}, a framework uniting Spatio-Temporal Graph Neural Networks, Actor-Critic reinforcement learning, and an autoregressive pointer decoder. By coupling spatial graph convolutions with temporal GRU sequence modeling over a sliding window ($W=5$), TGNN-NCO tracks non-stationary load drift across continuum tiers. Through SFC-priority ordering and dynamic residual-capacity masking, the framework systematically avoids intra-step node capacity collisions during sequential decoding. Furthermore, incorporating an analytical dirty-memory pre-copy migration penalty discourages unnecessary container relocations and helps preserve session continuity.
 
-Extensive empirical evaluations across six temporal stress scenarios demonstrate that TGNN-NCO achieves a \textbf{98.5\%} feasibility rate, maintains sub-5.1\,ms inference latency ($23,500\times$ faster than exact MINLP at $N=100$), and achieves an optimality gap within $0\%$ to $5\%$ of the theoretical ground truth. Future work will deploy TGNN-NCO as an O-RAN xApp integrated with a physical Kubernetes edge testbed, exploring multi-agent federated reinforcement learning for autonomous cross-operator network slice orchestration.
+Extensive empirical evaluations across six temporal stress scenarios demonstrate that TGNN-NCO achieves high feasibility compliance, maintains sub-5.1\,ms inference latency (over four orders of magnitude faster than exact MINLP solvers at $N=100$), and preserves a competitive optimality gap against exact optimization. Future work will investigate empirical deployment on physical edge testbeds, exploring multi-agent reinforcement learning for large-scale multi-cluster federations.
+
 
 % ==============================================================================
 % REFERENCES
